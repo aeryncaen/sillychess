@@ -108,24 +108,11 @@ func litePromotionID(piece int8) int32 {
 	}
 }
 
-func litePlayerID(turn int8, self int8) int32 {
-	if self == liteWhite {
-		if turn == liteWhite {
-			return playerSelfWhite
-		}
-		return playerOpponentBlack
+func litePlayerID(turn int8) int32 {
+	if turn == liteWhite {
+		return playerWhite
 	}
-	if turn == liteBlack {
-		return playerSelfBlack
-	}
-	return playerOpponentWhite
-}
-
-func liteWinnerToSelf(winner chess.Color) int8 {
-	if winner == chess.Black {
-		return liteBlack
-	}
-	return liteWhite
+	return playerBlack
 }
 
 func (b *liteBoard) reset() {
@@ -909,8 +896,6 @@ func parseLiteSAN(token string) (liteSANMove, bool) {
 func buildFeaturesFromMovesLite(movetext string, winner chess.Color) (*gameFeatures, bool) {
 	var board liteBoard
 	board.reset()
-	self := liteWinnerToSelf(winner)
-
 	capHint := strings.Count(movetext, " ")/2 + 4
 	if capHint < 8 {
 		capHint = 8
@@ -923,12 +908,10 @@ func buildFeaturesFromMovesLite(movetext string, winner chess.Color) (*gameFeatu
 		Promotion: make([]int32, 0, capHint),
 		Check:     make([]int32, 0, capHint),
 		Castle:    make([]int32, 0, capHint),
-		Step:      make([]int32, 0, capHint),
 		Player:    make([]int32, 0, capHint),
 		UCIMove:   make([]int32, 0, capHint),
 	}
 
-	step := 1
 	inVariation := 0
 	i := 0
 	for i < len(movetext) {
@@ -1005,14 +988,8 @@ func buildFeaturesFromMovesLite(movetext string, winner chess.Color) (*gameFeatu
 		features.Promotion = append(features.Promotion, litePromotionID(promo))
 		features.Check = append(features.Check, parsed.check)
 		features.Castle = append(features.Castle, int32(parsed.castle))
-		features.Player = append(features.Player, litePlayerID(turn, self))
+		features.Player = append(features.Player, litePlayerID(turn))
 		features.UCIMove = append(features.UCIMove, uciMoveID(from, to, litePromoChar(promo)))
-		if step > 1000 {
-			features.Step = append(features.Step, 1000)
-		} else {
-			features.Step = append(features.Step, int32(step))
-		}
-		step++
 	}
 
 	if len(features.Piece) == 0 {

@@ -27,10 +27,8 @@ const (
 )
 
 const (
-	playerSelfWhite     int32 = 1
-	playerSelfBlack     int32 = 2
-	playerOpponentWhite int32 = 3
-	playerOpponentBlack int32 = 4
+	playerWhite int32 = 1
+	playerBlack int32 = 2
 )
 
 type gameFeatures struct {
@@ -41,7 +39,6 @@ type gameFeatures struct {
 	Promotion []int32 `parquet:"name=promotion, type=INT32, repetitiontype=REPEATED"`
 	Check     []int32 `parquet:"name=check, type=INT32, repetitiontype=REPEATED"`
 	Castle    []int32 `parquet:"name=castle, type=INT32, repetitiontype=REPEATED"`
-	Step      []int32 `parquet:"name=step, type=INT32, repetitiontype=REPEATED"`
 	Player    []int32 `parquet:"name=player, type=INT32, repetitiontype=REPEATED"`
 	UCIMove   []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
 }
@@ -192,17 +189,11 @@ func pieceID(p chess.Piece) int32 {
 	}
 }
 
-func playerID(turn chess.Color, self chess.Color) int32 {
-	if self == chess.White {
-		if turn == chess.White {
-			return playerSelfWhite
-		}
-		return playerOpponentBlack
+func playerID(turn chess.Color) int32 {
+	if turn == chess.White {
+		return playerWhite
 	}
-	if turn == chess.Black {
-		return playerSelfBlack
-	}
-	return playerOpponentWhite
+	return playerBlack
 }
 
 func promotionID(p chess.PieceType) int32 {
@@ -357,12 +348,10 @@ func buildFeaturesFromMoves(movetext string, winner chess.Color) (*gameFeatures,
 		Promotion: make([]int32, 0, capHint),
 		Check:     make([]int32, 0, capHint),
 		Castle:    make([]int32, 0, capHint),
-		Step:      make([]int32, 0, capHint),
 		Player:    make([]int32, 0, capHint),
 		UCIMove:   make([]int32, 0, capHint),
 	}
 
-	step := 1
 	inVariation := 0
 	i := 0
 	for i < len(movetext) {
@@ -430,20 +419,13 @@ func buildFeaturesFromMoves(movetext string, winner chess.Color) (*gameFeatures,
 		features.Capture = append(features.Capture, captureID(move))
 		features.Promotion = append(features.Promotion, promotionID(move.Promo()))
 		features.Castle = append(features.Castle, castleID(move))
-		features.Player = append(features.Player, playerID(pos.Turn(), winner))
+		features.Player = append(features.Player, playerID(pos.Turn()))
 		features.Check = append(features.Check, checkIDFromToken(moveStr, move))
 		features.UCIMove = append(features.UCIMove, uciMoveID(
 			int(move.S1()), int(move.S2()), chessPromoChar(move.Promo()),
 		))
 
-		if step > 1000 {
-			features.Step = append(features.Step, 1000)
-		} else {
-			features.Step = append(features.Step, int32(step))
-		}
-
 		pos = nextPos
-		step += 1
 	}
 
 	if len(features.Piece) == 0 {

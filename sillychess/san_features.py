@@ -28,8 +28,7 @@ FEATURE_SPECS = {
     "promotion": [NULL] + list(PROMOS),
     "check": [NULL, "+", "#"],
     "castle": [NULL, "O-O", "O-O-O"],
-    "step": [NULL] + [str(i) for i in range(1, 1001)],
-    "player": [NULL, "self-white", "self-black", "opponent-white", "opponent-black"],
+    "player": [NULL, "white", "black"],
 }
 
 
@@ -41,16 +40,8 @@ FEATURE_IDS = {
 FEATURE_ORDER = list(FEATURE_SPECS.keys())
 
 
-def _player_feature(turn: bool, self_color: str) -> str:
-    if self_color == "white":
-        return "self-white" if turn == chess.WHITE else "opponent-black"
-    if self_color == "black":
-        return "self-black" if turn == chess.BLACK else "opponent-white"
-    raise ValueError("self_color must be 'white' or 'black'")
-
-
 def move_features(
-    board: chess.Board, move: chess.Move, step: int, self_color: str
+    board: chess.Board, move: chess.Move
 ) -> dict[str, str]:
     piece_type = board.piece_type_at(move.from_square)
     piece = PIECE_MAP.get(piece_type, NULL)
@@ -80,8 +71,7 @@ def move_features(
         "promotion": promotion,
         "check": check,
         "castle": castle,
-        "step": str(min(step, 1000)),
-        "player": _player_feature(board.turn, self_color),
+        "player": "white" if board.turn == chess.WHITE else "black",
     }
 
 

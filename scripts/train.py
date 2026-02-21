@@ -249,7 +249,7 @@ def main():
                 preds = outputs.argmax(dim=-1)
                 train_acc = ((preds == targets) & mask).sum().item() / mask.sum().clamp_min(1).item()
             elif args.uci:
-                pad_mask = (feat_y["step"] != 0).float()
+                pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
                 uci_targets = feat_y["uci_move"]
                 valid = (uci_targets >= 0) & (pad_mask > 0)
                 uci_targets_safe = uci_targets.clamp(min=0)
@@ -263,7 +263,7 @@ def main():
                 preds = outputs.argmax(dim=-1)
                 train_acc = ((preds == uci_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
             else:
-                pad_mask = (feat_y["step"] != 0).float()
+                pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
                 denom = pad_mask.sum().clamp_min(1.0)
                 # Extract per-feature targets from stacked (B, T, 9) tensor
                 feat_targets = feat_y["features"]

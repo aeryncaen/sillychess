@@ -71,15 +71,13 @@ def main():
 
             board = game.board()
             features = {name: [] for name in FEATURE_IDS}
-            step = 1
             for move in game.mainline_moves():
-                feat = move_features(board, move, step, self_color)
+                feat = move_features(board, move)
                 for name, value in feat.items():
                     features[name].append(FEATURE_IDS[name].get(value, 0))
                 board.push(move)
-                step += 1
 
-            if not features["step"]:
+            if not features["piece"]:
                 continue
 
             for name in FEATURE_IDS:
@@ -90,14 +88,14 @@ def main():
             if args.max_games is not None and count >= args.max_games:
                 break
 
-            if len(features_shard["step"]) >= args.shard_size:
+            if len(features_shard["piece"]) >= args.shard_size:
                 shard_path = output_dir / f"shard-{shard_idx:05d}.pt"
                 torch.save({"features": features_shard}, shard_path)
                 shard_idx += 1
                 features_shard = {name: [] for name in FEATURE_IDS}
 
         pbar.close()
-        if features_shard["step"]:
+        if features_shard["piece"]:
             shard_path = output_dir / f"shard-{shard_idx:05d}.pt"
             torch.save({"features": features_shard}, shard_path)
     finally:

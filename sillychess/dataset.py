@@ -46,11 +46,9 @@ def iter_pgn_games(pgn_path, max_games=None, self_color="white", winner_only=Fal
                 game_self_color = self_color
             board = game.board()
             features = []
-            step = 1
             for move in game.mainline_moves():
-                features.append(move_features(board, move, step, game_self_color))
+                features.append(move_features(board, move))
                 board.push(move)
-                step += 1
             yield GameMoves(features=features)
             count += 1
             if max_games is not None and count >= max_games:
@@ -76,12 +74,10 @@ def iter_jsonl_games(jsonl_path, max_games=None, self_color="white", winner_only
                 game_self_color = self_color
             board = chess.Board()
             features = []
-            step = 1
             for san in moves:
                 move = board.parse_san(san)
-                features.append(move_features(board, move, step, game_self_color))
+                features.append(move_features(board, move))
                 board.push(move)
-                step += 1
             yield GameMoves(features=features)
             count += 1
             if max_games is not None and count >= max_games:
@@ -273,14 +269,17 @@ class CachedChessDataset(Dataset):
     def _getitem_2d(self, idx):
         """Full-game bucketed item for composite (2D) mode.
 
-        Pre-stacks the 9 feature columns into a single (T, 9) tensor under
-        the key "features" for fast embedding lookup.  Also returns "step"
-        and "uci_move" as separate keys for loss masking/targets.
+        Pre-stacks the 8 feature columns into a single (T, 8) tensor under
+        the key "features" for fast embedding lookup.  Also returns
+        "uci_move" as a separate key for loss targets.
+
+        Padding mask: piece != 0 (piece is feature index 0, always nonzero
+        for real moves, zero for padding).
         """
         seq = self.sequences[self._kept_indices[idx]]
         padded_len = self.padded_lens[idx]
 
-        # Stack all 9 feature columns into (padded_len, 9)
+        # Stack all 8 feature columns into (padded_len, 8)
         feature_names = list(FEATURE_IDS.keys())
         stacked = np.zeros((padded_len, len(feature_names)), dtype=np.int64)
         for i, name in enumerate(feature_names):
@@ -288,12 +287,8 @@ class CachedChessDataset(Dataset):
             stacked[:len(arr), i] = arr
 
         t = torch.from_numpy(stacked)
-        feat_x = {"features": t[:-1]}                     # (T-1, 9)
-        feat_y = {"features": t[1:]}                       # (T-1, 9)
-
-        # step for padding mask (step is one of the 9 features)
-        step_idx = feature_names.index("step")
-        feat_y["step"] = feat_y["features"][:, step_idx]
+        feat_x = {"features": t[:-1]}                     # (T-1, 8)
+        feat_y = {"features": t[1:]}                       # (T-1, 8)
 
         # uci_move for loss target
         if "uci_move" in seq:

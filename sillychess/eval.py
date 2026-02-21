@@ -30,7 +30,7 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
             feat_y = {name: t.to(device) for name, t in feat_y.items()}
 
             outputs = model(feat_x)
-            pad_mask = (feat_y["step"] != 0).float()
+            pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
             denom = pad_mask.sum().clamp_min(1.0)
 
             feat_targets = feat_y["features"]
@@ -193,7 +193,7 @@ def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
                 n_tokens = mask.sum().item()
                 n_correct = ((preds == targets) & mask).sum().item()
             else:
-                pad_mask = feat_y["step"] != 0
+                pad_mask = feat_y["features"][:, :, 0] != 0  # piece != 0
                 valid = (targets >= 0) & pad_mask
                 targets_safe = targets.clamp(min=0)
                 raw = torch.nn.functional.cross_entropy(
