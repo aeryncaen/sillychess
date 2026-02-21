@@ -69,67 +69,84 @@ def _apply_rotary(x, cos, sin):
 # ---------------------------------------------------------------------------
 
 class CausalLerp(nn.Module):
-    """Content-gated causal lerp on first 50% of dims.
+    """Trapezoidal one-step accumulation on first 50% of dims.
 
-    x_lerp[t] = (1 - gate) * x[t] + gate * x[t-1]
+    Mamba-3 §3.1, Proposition 1 (generalized trapezoidal discretization):
 
-    Remaining dims pass through unchanged.  Gate reads the full d_model
-    but only gates the first half.
-    Initialized near-identity (bias=-2.0 -> sigmoid ~ 0.12).
+        out[t] = α[t] * B[t-1] * x[t-1]  +  (1 - α[t]) * B[t] * x[t]
+
+    where α[t] = sigmoid(proj(x[t])) is the data-dependent trapezoidal
+    parameter (analogous to 1-λ in the paper: α=1 is pure Euler on the
+    previous step, α=0 is pure current step).
+
+    B[t] is a content-dependent projection of x[t] into the lerp subspace.
+
+    Remaining dims pass through unchanged.
+    Initialized near-identity (α ≈ 0.12 so output ≈ current token).
     """
 
     def __init__(self, d_model, init_bias=-2.0):
         super().__init__()
         self.lerp_dim = d_model // 2
-        self.gate_proj = nn.Linear(d_model, self.lerp_dim, bias=True)
-        nn.init.zeros_(self.gate_proj.weight)
-        nn.init.constant_(self.gate_proj.bias, init_bias)
+        # trapezoidal mixing parameter α (data-dependent)
+        self.alpha_proj = nn.Linear(d_model, self.lerp_dim, bias=True)
+        nn.init.zeros_(self.alpha_proj.weight)
+        nn.init.constant_(self.alpha_proj.bias, init_bias)
+        # content-dependent input projection B
+        self.b_proj = nn.Linear(d_model, self.lerp_dim, bias=False)
 
     def forward(self, x):
         """x: (B, T, D) -> same shape."""
-        x_lerp = x[..., :self.lerp_dim]
-        x_pass = x[..., self.lerp_dim:]
-        x_prev = F.pad(x_lerp[:, :-1], (0, 0, 1, 0))
-        gate = torch.sigmoid(self.gate_proj(x))
-        x_lerp = (1 - gate) * x_lerp + gate * x_prev
-        return torch.cat([x_lerp, x_pass], dim=-1)
+        # content-dependent projections
+        alpha = torch.sigmoid(self.alpha_proj(x))    # (B, T, lerp_dim)
+        bx = self.b_proj(x)                          # (B, T, lerp_dim)
+
+        # shift: bx_prev[t] = bx[t-1], zero at t=0
+        bx_prev = F.pad(bx[:, :-1], (0, 0, 1, 0))   # (B, T, lerp_dim)
+
+        # trapezoidal one-step: convex combination of both endpoints
+        x_lerp = alpha * bx_prev + (1 - alpha) * bx
+
+        return torch.cat([x_lerp, x[..., self.lerp_dim:]], dim=-1)
 
 
 # ---------------------------------------------------------------------------
-# Data-dependent RoPE (standalone, NOT inside attention)
+# Data-dependent RoPE on Q/K
 # ---------------------------------------------------------------------------
 
 class DDRoPE(nn.Module):
-    """Data-dependent cumulative rotation on first dd_dim dims.
+    """Data-dependent rotary embeddings on a portion of Q/K head dims.
 
-    Standalone state-tracking mechanism on the residual stream, inspired
-    by Mamba-3's complex-valued SSM (§3.2, Proposition 3).  Projects input
-    to per-timestep angle deltas, cumsums for cumulative phase, applies
-    rotation.  NOT applied to Q/K inside attention.
+    Mamba-3 §3.2, Proposition 3: complex-valued SSM is equivalent to
+    data-dependent RoPE applied to B,C (= K,Q in the SSD/attention dual).
 
-    dd_dim is 50% of the CausalLerp dims = 25% of d_model.
+    Projects input to per-head, per-timestep angle deltas, cumsums for
+    cumulative phase.  Returns cos/sin for application to the first
+    dd_pairs pairs of each head in Q and K.
 
     Args:
-        d_input: Full model dim (reads all dims to compute angles).
-        dd_dim:  Number of dims to rotate (must be even).
+        d_model:          Full model dim (input to angle projection).
+        n_head:           Number of attention heads.
+        dd_pairs_per_head: Number of rotation pairs per head.
     """
 
-    def __init__(self, d_input, dd_dim):
+    def __init__(self, d_model, n_head, dd_pairs_per_head):
         super().__init__()
-        assert dd_dim % 2 == 0, f"dd_dim must be even, got {dd_dim}"
-        self.dd_dim = dd_dim
-        self.dd_pairs = dd_dim // 2
-        self.dd_proj = nn.Linear(d_input, self.dd_pairs, bias=True)
+        self.n_head = n_head
+        self.dd_pairs_per_head = dd_pairs_per_head
+        self.dd_dim_per_head = dd_pairs_per_head * 2
+        total_pairs = n_head * dd_pairs_per_head
+        self.dd_proj = nn.Linear(d_model, total_pairs, bias=True)
         nn.init.zeros_(self.dd_proj.weight)
         nn.init.zeros_(self.dd_proj.bias)
 
     def forward(self, x):
-        """x: (B, T, D). Applies cumulative rotation to first dd_dim dims."""
-        deltas = self.dd_proj(x)               # (B, T, dd_pairs)
-        angles = deltas.cumsum(dim=1)          # cumulative phase
-        x_dd = x[..., :self.dd_dim]
-        x_dd = _apply_rotary(x_dd, angles.cos(), angles.sin())
-        return torch.cat([x_dd, x[..., self.dd_dim:]], dim=-1)
+        """x: (B, T, D) -> (dd_cos, dd_sin) each (B, T, n_head, dd_pairs)."""
+        B, T, _ = x.shape
+        deltas = self.dd_proj(x)                                    # (B, T, total_pairs)
+        deltas = deltas.view(B, T, self.n_head, self.dd_pairs_per_head)
+        angles = deltas.cumsum(dim=1)                               # cumulative phase
+        return angles.cos(), angles.sin()
 
 
 # ---------------------------------------------------------------------------
@@ -160,17 +177,17 @@ class TransformerBlock(nn.Module):
             self.causal_lerp = CausalLerp(d_model)
 
         if use_dd_rope:
-            # 50% of lerp dims = 25% of d_model, rounded down to even
-            dd_dim = (d_model // 4) & ~1
-            assert dd_dim > 0, f"d_model too small for dd-rope: {d_model}"
-            self.dd_rope = DDRoPE(d_input=d_model, dd_dim=dd_dim)
+            # ~25% of each head's dims get data-dependent rotation
+            dd_pairs = max(self.d_head // 8, 1)
+            self.dd_rope = DDRoPE(d_model, n_head, dd_pairs)
+            self.dd_pairs = dd_pairs
 
         self.attn_norm = nn.RMSNorm(d_model)
         self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.q_norm = nn.RMSNorm(self.d_head)
         self.k_norm = nn.RMSNorm(self.d_head)
-        self.q_post_bias = nn.Parameter(torch.ones(self.d_head))
-        self.k_post_bias = nn.Parameter(torch.ones(self.d_head))
+        self.q_post_bias = nn.Parameter(torch.ones(n_head, self.d_head))
+        self.k_post_bias = nn.Parameter(torch.ones(n_head, self.d_head))
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.attn_drop = nn.Dropout(dropout)
 
@@ -192,20 +209,32 @@ class TransformerBlock(nn.Module):
         B, T, D = x.shape
         nh, dh = self.n_head, self.d_head
 
-        # Pre-attention SSM: CausalLerp (50% dims) + DD-RoPE (25% dims)
+        # Pre-attention: trapezoidal one-step (CausalLerp)
         if self.use_lerp:
             x = self.causal_lerp(x)
-        if self.use_dd_rope:
-            x = self.dd_rope(x)
 
-        # Sequence attention (standard fixed RoPE on Q/K)
+        # Attention with RoPE (fixed + optional data-dependent on Q/K)
         h = self.attn_norm(x)
         qkv = self.w_qkv(h).reshape(B, T, 3, nh, dh)
         q, k, v = qkv.unbind(dim=2)               # (B, T, nh, dh)
         q = self.q_norm(q) * self.q_post_bias
         k = self.k_norm(k) * self.k_post_bias
-        q = _apply_rotary(q, rope_cos, rope_sin)
-        k = _apply_rotary(k, rope_cos, rope_sin)
+
+        if self.use_dd_rope:
+            dd = self.dd_pairs * 2  # dims covered by dd-rope per head
+            dd_cos, dd_sin = self.dd_rope(x)       # (B, T, nh, dd_pairs)
+            # DD-RoPE on first dd dims of each head
+            q_dd = _apply_rotary(q[..., :dd], dd_cos, dd_sin)
+            k_dd = _apply_rotary(k[..., :dd], dd_cos, dd_sin)
+            # Fixed RoPE on remaining dims (slice freqs to match)
+            fix_pairs = (dh - dd) // 2
+            q_fix = _apply_rotary(q[..., dd:], rope_cos[..., :fix_pairs], rope_sin[..., :fix_pairs])
+            k_fix = _apply_rotary(k[..., dd:], rope_cos[..., :fix_pairs], rope_sin[..., :fix_pairs])
+            q = torch.cat([q_dd, q_fix], dim=-1)
+            k = torch.cat([k_dd, k_fix], dim=-1)
+        else:
+            q = _apply_rotary(q, rope_cos, rope_sin)
+            k = _apply_rotary(k, rope_cos, rope_sin)
         y = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
             is_causal=True,
