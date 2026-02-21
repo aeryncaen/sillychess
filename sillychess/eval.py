@@ -251,6 +251,7 @@ def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
         loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     model.eval()
     total_loss = 0.0
+    total_correct = 0
     total_tokens = 0
 
     with torch.no_grad():
@@ -262,17 +263,18 @@ def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
 
             logits = model(feat_x)  # (B, T, vocab_size)
             targets = feat_y["uci_move"]
+            preds = logits.argmax(dim=-1)
 
             if uci_plain:
-                # Full-game: use ignore_index for PAD
+                mask = targets != PAD_ID
                 batch_loss = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     targets.reshape(-1),
                     ignore_index=PAD_ID,
                 )
-                n_tokens = (targets != PAD_ID).sum().item()
+                n_tokens = mask.sum().item()
+                n_correct = ((preds == targets) & mask).sum().item()
             else:
-                # Windowed: mask by step != 0 and valid UCI targets
                 pad_mask = feat_y["step"] != 0
                 valid = (targets >= 0) & pad_mask
                 targets_safe = targets.clamp(min=0)
@@ -285,15 +287,17 @@ def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
                 n_valid = valid.float().sum().clamp_min(1.0)
                 batch_loss = (raw * valid.float()).sum() / n_valid
                 n_tokens = n_valid.item()
+                n_correct = ((preds == targets_safe) & valid).sum().item()
 
             if n_tokens > 0:
                 total_loss += batch_loss.item() * n_tokens
+                total_correct += n_correct
                 total_tokens += n_tokens
 
     model.train()
     if total_tokens == 0:
-        return float("nan")
-    return total_loss / total_tokens
+        return float("nan"), 0.0
+    return total_loss / total_tokens, total_correct / total_tokens
 
 
 def eval_legality_uci(model, eval_sequences, block_size, device, max_games=50,

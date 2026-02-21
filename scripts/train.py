@@ -359,14 +359,14 @@ def main():
             # --- Eval ---
             if eval_dataset is not None and step % args.eval_every == 0:
                 if args.uci_plain or args.uci:
-                    val = eval_loss_uci(model, eval_dataset, args.batch_size, device)
+                    val, acc = eval_loss_uci(model, eval_dataset, args.batch_size, device)
                     leg, leg_total = eval_legality_uci(
                         model, eval_dataset.sequences, args.block_size, device,
                         max_games=args.eval_legality_games,
                     )
                     leg_pct = 100.0 * leg / max(1, leg_total)
                     tqdm.write(
-                        f"  eval step={step}: val_loss={val:.4f} "
+                        f"  eval step={step}: val_loss={val:.4f} acc={acc:.3f} "
                         f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
                     )
                 else:
