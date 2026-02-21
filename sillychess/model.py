@@ -93,11 +93,12 @@ def proj_per_feature(x, w, bias=None):
 # ---------------------------------------------------------------------------
 
 class DDRoPE(nn.Module):
-    """Data-dependent RoPE on the last quarter of the head/descriptor dim.
+    """Data-dependent RoPE on the second half of the head/descriptor dim.
 
-    Splits the rotation-pair dimension into fixed (3/4) and data-dependent (1/4).
-    DD angles = cumsum of a learned projection from the input, providing
-    SSM-equivalent state tracking through cumulative phase shifts.
+    First half gets standard fixed-frequency RoPE (positional anchoring).
+    Second half gets DD-RoPE: cumsum of learned projection deltas from the
+    input, providing SSM-equivalent state tracking through cumulative phase
+    shifts.  No fixed RoPE on the DD half.
 
     Works for both 1D (B, T, D) and 2D (B, T, NF, D) inputs.
 
@@ -110,14 +111,14 @@ class DDRoPE(nn.Module):
 
     def __init__(self, d_input, n_heads, head_dim, per_head=False):
         super().__init__()
-        assert head_dim % 8 == 0, f"head_dim must be divisible by 8 for dd-rope, got {head_dim}"
+        assert head_dim % 4 == 0, f"head_dim must be divisible by 4 for dd-rope, got {head_dim}"
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.per_head = per_head
-        # DD covers 1/4 of total dims = head_dim // 4 actual dims
-        # = head_dim // 8 rotation pairs (each pair = 2 dims).
-        self.dd_pairs = head_dim // 8
-        self.dd_dim = self.dd_pairs * 2                # always even
+        # DD covers 1/2 of total dims.  Fixed RoPE gets the other half.
+        # dd_pairs = head_dim // 4 rotation pairs (each pair = 2 dims = head_dim // 2).
+        self.dd_pairs = head_dim // 4
+        self.dd_dim = self.dd_pairs * 2                # head_dim // 2
 
         if per_head:
             # 2D mode: project per-feature/head.  Linear(DD, dd_pairs) broadcasts
@@ -147,10 +148,7 @@ class DDRoPE(nn.Module):
         return deltas.cumsum(dim=1)
 
     def apply_hybrid(self, qk, dd_angles, fixed_cos, fixed_sin):
-        """Apply hybrid RoPE: fixed on first 3/4 dims, DD on last 1/4 dims.
-
-        Splits qk into fixed region and DD region, applies rotary to each
-        with their respective angles, then concatenates back.
+        """Apply hybrid RoPE: fixed on first half, DD on second half.
 
         Args:
             qk:         (..., T, n_heads, head_dim)
@@ -161,16 +159,16 @@ class DDRoPE(nn.Module):
         Returns:
             Rotated tensor, same shape as qk.
         """
-        fd = self.head_dim - self.dd_dim       # fixed actual dims (3/4)
+        fd = self.dd_dim                       # fixed half = dd_dim = head_dim // 2
         fp = fd // 2                           # fixed rotation pairs
 
         qk_fixed = qk[..., :fd]
         qk_dd = qk[..., fd:]
 
-        # Fixed RoPE on first 3/4 of dims (slice cos/sin to match)
+        # Fixed RoPE on first half
         qk_fixed = _apply_rotary(qk_fixed, fixed_cos[..., :fp], fixed_sin[..., :fp])
 
-        # DD RoPE on last 1/4 of dims
+        # DD RoPE on second half
         qk_dd = _apply_rotary(qk_dd, dd_angles.cos(), dd_angles.sin())
 
         return torch.cat([qk_fixed, qk_dd], dim=-1)
@@ -181,37 +179,30 @@ class DDRoPE(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CausalLerp(nn.Module):
-    """Content-gated causal lerp on the last half of descriptor dims.
+    """Content-gated causal lerp across all dims.
 
     x_mixed[t] = (1 - gate) * x[t] + gate * x[t-1]
 
-    Applied only to the last half of the descriptor dimension; the first
-    half passes through unchanged.  Gate is content-dependent per-feature.
+    Gate is content-dependent per-feature.
     Initialized near-identity (bias=-2.0 → sigmoid ≈ 0.12).
     """
 
     def __init__(self, inner_dim, init_bias=-2.0):
         super().__init__()
-        self.half_dim = inner_dim // 2
-        self.gate_proj = nn.Linear(inner_dim, self.half_dim, bias=True)
+        self.inner_dim = inner_dim
+        self.gate_proj = nn.Linear(inner_dim, inner_dim, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, init_bias)
 
     def forward(self, x):
         """x: (B, T, ..., D) -> same shape. Works for 3D (B,T,D) or 4D (B,T,NF,D)."""
-        hd = self.half_dim
-        x_static = x[..., :hd]
-        x_cur = x[..., hd:]
-
-        # Shift x_cur one step back along dim 1: pad t=0 with zeros
-        # Build pad spec: 0 on last dim, then 0 on any middle dims, then (1,0) on time
+        # Shift x one step back along dim 1: pad t=0 with zeros
         n_trailing = x.ndim - 2  # dims after the time dim
         pad = (0, 0) * n_trailing + (1, 0)
-        x_prev = F.pad(x_cur[:, :-1], pad)
+        x_prev = F.pad(x[:, :-1], pad)
 
         gate = torch.sigmoid(self.gate_proj(x))
-        x_mixed = (1 - gate) * x_cur + gate * x_prev
-        return torch.cat([x_static, x_mixed], dim=-1)
+        return (1 - gate) * x + gate * x_prev
 
 
 class ChessBlock(nn.Module):
