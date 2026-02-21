@@ -170,10 +170,7 @@ def main():
     print("init: building model...")
     if args.uci_plain:
         vocab_size = UCI_PLAIN_VOCAB_SIZE
-        # Block size for full-game mode = largest bucket - 1 (input is bucket_len - 1)
-        block_size = max(dataset.buckets) - 1 if dataset.uci_plain else args.block_size
         model = PlainTransformerModel(
-            block_size=block_size,
             d_model=args.w_dim,
             n_head=args.n_head,
             n_layer=args.n_layer,
@@ -191,7 +188,6 @@ def main():
         print(f"init: model ready (plain 1D, d_model={args.w_dim}, n_head={args.n_head}, vocab={vocab_size}{flag_str})")
     else:
         model = TwoStageTransformerModel(
-            block_size=args.block_size,
             w_dim=args.w_dim,
             rows_per_feature=args.rows_per_feature,
             n_layer=args.n_layer,
@@ -225,7 +221,6 @@ def main():
     if args.uci_plain:
         print(
             "model:",
-            f"block_size={block_size}",
             f"d_model={args.w_dim}",
             f"n_head={args.n_head}",
             f"n_layer={args.n_layer}",
@@ -236,7 +231,6 @@ def main():
         total_rows = len(FEATURE_SIZES) * args.rows_per_feature
         print(
             "model:",
-            f"block_size={args.block_size}",
             f"w_dim={args.w_dim}",
             f"rows_per_feature={args.rows_per_feature}",
             f"total_rows={total_rows}",

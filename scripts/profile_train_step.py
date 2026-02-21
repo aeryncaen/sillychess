@@ -142,7 +142,6 @@ def main() -> None:
     if args.uci_plain:
         vocab_size = UCI_PLAIN_VOCAB_SIZE
         model = PlainTransformerModel(
-            block_size=args.block_size,
             d_model=args.w_dim,
             n_head=args.n_head,
             n_layer=args.n_layer,
@@ -153,7 +152,6 @@ def main() -> None:
         ).to(device)
     else:
         model = TwoStageTransformerModel(
-            block_size=args.block_size,
             w_dim=args.w_dim,
             rows_per_feature=args.rows_per_feature,
             n_layer=args.n_layer,

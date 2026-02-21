@@ -391,11 +391,10 @@ class PlainTransformerModel(nn.Module):
     Embedding weights are tied with the output head.
     """
 
-    def __init__(self, block_size, d_model, n_head, n_layer, vocab_size, dropout=0.1,
+    def __init__(self, d_model, n_head, n_layer, vocab_size, dropout=0.1,
                  use_lerp=False, use_feat_attn=False):
         super().__init__()
         self.uci_mode = True
-        self.block_size = block_size
 
         self.embed = nn.Embedding(vocab_size, d_model)
         self.drop = nn.Dropout(dropout)
@@ -433,8 +432,6 @@ class PlainTransformerModel(nn.Module):
         else:
             x_ids = feature_ids
         B, T = x_ids.shape
-        if T > self.block_size:
-            raise ValueError("sequence length exceeds block size")
 
         x = self.drop(self.embed(x_ids.clamp(min=0)))
 
@@ -456,7 +453,6 @@ class PlainTransformerModel(nn.Module):
 class TwoStageTransformerModel(nn.Module):
     def __init__(
         self,
-        block_size,
         w_dim=48,
         rows_per_feature=4,
         n_layer=6,
@@ -481,7 +477,6 @@ class TwoStageTransformerModel(nn.Module):
         n_orig_features = len(feature_sizes)
         total_rows = n_orig_features * rows_per_feature
 
-        self.block_size = block_size
         self.w_dim = w_dim
         self.rows_per_feature = rows_per_feature
         self.total_rows = total_rows
@@ -520,8 +515,6 @@ class TwoStageTransformerModel(nn.Module):
     def forward(self, feature_ids):
         first = next(iter(feature_ids))
         batch_size, seq_len = feature_ids[first].shape
-        if seq_len > self.block_size:
-            raise ValueError("sequence length exceeds block size")
 
         x = self.embed(feature_ids)           # (B, T, total_rows, DD)
         x = self.drop(x)
