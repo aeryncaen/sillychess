@@ -110,6 +110,8 @@ def main():
                         help="enable CausalLerp (both 1D and 2D models)")
     parser.add_argument("--feat-attn", action="store_true",
                         help="enable feature attention MLP (both 1D and 2D models)")
+    parser.add_argument("--dd-rope", action="store_true",
+                        help="data-dependent RoPE on 1/4 of dims (cumsum of learned deltas)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--save-model", default="model.pt")
     args = parser.parse_args()
@@ -178,12 +180,15 @@ def main():
             dropout=args.dropout,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
+            use_dd_rope=args.dd_rope,
         ).to(device)
         flags = []
         if args.lerp:
             flags.append("lerp")
         if args.feat_attn:
             flags.append("feat_attn")
+        if args.dd_rope:
+            flags.append("dd_rope")
         flag_str = f" +{'+'.join(flags)}" if flags else ""
         print(f"init: model ready (plain 1D, d_model={args.w_dim}, n_head={args.n_head}, vocab={vocab_size}{flag_str})")
     else:
@@ -196,12 +201,15 @@ def main():
             uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
+            use_dd_rope=args.dd_rope,
         ).to(device)
         flags = []
         if args.lerp:
             flags.append("lerp")
         if args.feat_attn:
             flags.append("feat_attn")
+        if args.dd_rope:
+            flags.append("dd_rope")
         flag_str = f" +{'+'.join(flags)}" if flags else ""
         print(f"init: model ready (2D, uci_mode={model.uci_mode}{flag_str})")
 

@@ -89,6 +89,94 @@ def proj_per_feature(x, w, bias=None):
 
 
 # ---------------------------------------------------------------------------
+# Data-dependent RoPE (ULB hybrid: fixed on 3/4, DD cumsum on 1/4 of dims)
+# ---------------------------------------------------------------------------
+
+class DDRoPE(nn.Module):
+    """Data-dependent RoPE on the last quarter of the head/descriptor dim.
+
+    Splits the rotation-pair dimension into fixed (3/4) and data-dependent (1/4).
+    DD angles = cumsum of a learned projection from the input, providing
+    SSM-equivalent state tracking through cumulative phase shifts.
+
+    Works for both 1D (B, T, D) and 2D (B, T, NF, D) inputs.
+
+    Args:
+        d_input:   Input dim for the DD projection (d_model for 1D, desc_dim for 2D).
+        n_heads:   Number of heads (n_head for 1D, n_features for 2D).
+        head_dim:  Dim per head (d_head for 1D, desc_dim for 2D).
+                   Must be divisible by 4.
+    """
+
+    def __init__(self, d_input, n_heads, head_dim, per_head=False):
+        super().__init__()
+        assert head_dim % 8 == 0, f"head_dim must be divisible by 8 for dd-rope, got {head_dim}"
+        self.n_heads = n_heads
+        self.head_dim = head_dim
+        self.per_head = per_head
+        # DD covers 1/4 of total dims = head_dim // 4 actual dims
+        # = head_dim // 8 rotation pairs (each pair = 2 dims).
+        self.dd_pairs = head_dim // 8
+        self.dd_dim = self.dd_pairs * 2                # always even
+
+        if per_head:
+            # 2D mode: project per-feature/head.  Linear(DD, dd_pairs) broadcasts
+            # over the head dim when input is (B, T, NF, DD).
+            self.dd_proj = nn.Linear(d_input, self.dd_pairs, bias=True)
+        else:
+            # 1D mode: project from d_model to all heads at once.
+            self.dd_proj = nn.Linear(d_input, n_heads * self.dd_pairs, bias=True)
+        nn.init.zeros_(self.dd_proj.weight)
+        nn.init.zeros_(self.dd_proj.bias)
+
+    def compute_angles(self, x):
+        """Compute cumulative DD rotation angles.
+
+        Args:
+            x: (B, T, D) for 1D, or (B, T, NF, DD) for 2D (per_head=True).
+
+        Returns:
+            (B, T, n_heads, dd_pairs) cumulative angles.
+        """
+        if self.per_head:
+            # 2D: (B, T, NF, DD) -> (B, T, NF, dd_pairs) via broadcast
+            return self.dd_proj(x).cumsum(dim=1)
+        B, T, _ = x.shape
+        deltas = self.dd_proj(x)                          # (B, T, n_heads * dd_pairs)
+        deltas = deltas.view(B, T, self.n_heads, self.dd_pairs)
+        return deltas.cumsum(dim=1)
+
+    def apply_hybrid(self, qk, dd_angles, fixed_cos, fixed_sin):
+        """Apply hybrid RoPE: fixed on first 3/4 dims, DD on last 1/4 dims.
+
+        Splits qk into fixed region and DD region, applies rotary to each
+        with their respective angles, then concatenates back.
+
+        Args:
+            qk:         (..., T, n_heads, head_dim)
+            dd_angles:  (B, T, n_heads, dd_pairs)
+            fixed_cos:  (1, T, 1, head_dim//2) — standard RoPE cos
+            fixed_sin:  (1, T, 1, head_dim//2) — standard RoPE sin
+
+        Returns:
+            Rotated tensor, same shape as qk.
+        """
+        fd = self.head_dim - self.dd_dim       # fixed actual dims (3/4)
+        fp = fd // 2                           # fixed rotation pairs
+
+        qk_fixed = qk[..., :fd]
+        qk_dd = qk[..., fd:]
+
+        # Fixed RoPE on first 3/4 of dims (slice cos/sin to match)
+        qk_fixed = _apply_rotary(qk_fixed, fixed_cos[..., :fp], fixed_sin[..., :fp])
+
+        # DD RoPE on last 1/4 of dims
+        qk_dd = _apply_rotary(qk_dd, dd_angles.cos(), dd_angles.sin())
+
+        return torch.cat([qk_fixed, qk_dd], dim=-1)
+
+
+# ---------------------------------------------------------------------------
 # Layer block
 # ---------------------------------------------------------------------------
 
@@ -135,18 +223,23 @@ class ChessBlock(nn.Module):
         x = x + feat_attn_mlp(norm2(x))                 # softmax feat attn replacing SwiGLU gate
     """
 
-    def __init__(self, n_features, desc_dim, dropout=0.1, use_lerp=False, use_feat_attn=False):
+    def __init__(self, n_features, desc_dim, dropout=0.1, use_lerp=False, use_feat_attn=False,
+                 use_dd_rope=False):
         super().__init__()
         NF = n_features
         DD = desc_dim
         self.use_lerp = use_lerp
         self.use_feat_attn = use_feat_attn
+        self.use_dd_rope = use_dd_rope
         # SwiGLU-style 8/3 expansion on descriptor dim, snapped to multiple of 8
         FFN_DD = ((DD * 8 // 3 + 7) // 8) * 8
 
         # --- Causal lerp: SSM-style temporal mixing on half of DD ---
         if use_lerp:
             self.causal_lerp = CausalLerp(DD)
+
+        if use_dd_rope:
+            self.dd_rope = DDRoPE(d_input=DD, n_heads=NF, head_dim=DD, per_head=True)
 
         # --- Sequence attention (per-feature QKV on descriptor dim) ---
         init_scale = DD ** -0.5
@@ -213,7 +306,11 @@ class ChessBlock(nn.Module):
         k = self.k_norm(k) * self.k_post_bias
 
         # RoPE on descriptors (after QK norm)
-        if rope_cos is not None:
+        if self.use_dd_rope and rope_cos is not None:
+            dd_angles = self.dd_rope.compute_angles(x)
+            q = self.dd_rope.apply_hybrid(q, dd_angles, rope_cos, rope_sin)
+            k = self.dd_rope.apply_hybrid(k, dd_angles, rope_cos, rope_sin)
+        elif rope_cos is not None:
             q = _apply_rotary(q, rope_cos, rope_sin)
             k = _apply_rotary(k, rope_cos, rope_sin)
 
@@ -311,16 +408,21 @@ class PlainBlock(nn.Module):
                  "features" (same mechanism as ChessBlock's feature attention).
     """
 
-    def __init__(self, d_model, n_head, dropout=0.1, use_lerp=False, use_feat_attn=False):
+    def __init__(self, d_model, n_head, dropout=0.1, use_lerp=False, use_feat_attn=False,
+                 use_dd_rope=False):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.d_head = d_model // n_head
         self.use_lerp = use_lerp
         self.use_feat_attn = use_feat_attn
+        self.use_dd_rope = use_dd_rope
 
         if use_lerp:
             self.causal_lerp = CausalLerp(d_model)
+
+        if use_dd_rope:
+            self.dd_rope = DDRoPE(d_input=d_model, n_heads=n_head, head_dim=self.d_head)
 
         self.attn_norm = nn.RMSNorm(d_model)
         self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
@@ -355,8 +457,13 @@ class PlainBlock(nn.Module):
         h = self.attn_norm(x)
         qkv = self.w_qkv(h).reshape(B, T, 3, nh, dh)
         q, k, v = qkv.unbind(dim=2)               # (B, T, nh, dh)
-        q = _apply_rotary(q, rope_cos, rope_sin)
-        k = _apply_rotary(k, rope_cos, rope_sin)
+        if self.use_dd_rope:
+            dd_angles = self.dd_rope.compute_angles(x)
+            q = self.dd_rope.apply_hybrid(q, dd_angles, rope_cos, rope_sin)
+            k = self.dd_rope.apply_hybrid(k, dd_angles, rope_cos, rope_sin)
+        else:
+            q = _apply_rotary(q, rope_cos, rope_sin)
+            k = _apply_rotary(k, rope_cos, rope_sin)
         y = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
             is_causal=True,
@@ -392,7 +499,7 @@ class PlainTransformerModel(nn.Module):
     """
 
     def __init__(self, d_model, n_head, n_layer, vocab_size, dropout=0.1,
-                 use_lerp=False, use_feat_attn=False):
+                 use_lerp=False, use_feat_attn=False, use_dd_rope=False):
         super().__init__()
         self.uci_mode = True
 
@@ -404,7 +511,8 @@ class PlainTransformerModel(nn.Module):
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         self.layers = nn.ModuleList([
-            PlainBlock(d_model, n_head, dropout, use_lerp=use_lerp, use_feat_attn=use_feat_attn)
+            PlainBlock(d_model, n_head, dropout, use_lerp=use_lerp,
+                       use_feat_attn=use_feat_attn, use_dd_rope=use_dd_rope)
             for _ in range(n_layer)
         ])
         self.ln_f = nn.RMSNorm(d_model)
@@ -461,6 +569,7 @@ class TwoStageTransformerModel(nn.Module):
         uci_vocab_size=None,
         use_lerp=False,
         use_feat_attn=False,
+        use_dd_rope=False,
         # Legacy compat (ignored)
         h_rows=None, n_head=None, n_intra_layer=None, n_inter_layer=None,
         feature_decoder_layers=None, ml_decoder_queries=None,
@@ -501,6 +610,7 @@ class TwoStageTransformerModel(nn.Module):
                 dropout=dropout,
                 use_lerp=use_lerp,
                 use_feat_attn=use_feat_attn,
+                use_dd_rope=use_dd_rope,
             )
             for _ in range(n_layer)
         ])

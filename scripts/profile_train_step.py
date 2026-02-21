@@ -134,6 +134,8 @@ def main() -> None:
                         help="enable CausalLerp")
     parser.add_argument("--feat-attn", action="store_true",
                         help="enable feature attention MLP")
+    parser.add_argument("--dd-rope", action="store_true",
+                        help="data-dependent RoPE on 1/4 of dims")
     args = parser.parse_args()
     device = resolve_device(args.device)
 
@@ -149,6 +151,7 @@ def main() -> None:
             dropout=args.dropout,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
+            use_dd_rope=args.dd_rope,
         ).to(device)
     else:
         model = TwoStageTransformerModel(
@@ -160,6 +163,7 @@ def main() -> None:
             uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
+            use_dd_rope=args.dd_rope,
         ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     model.train()
@@ -185,6 +189,8 @@ def main() -> None:
         flags.append("lerp")
     if args.feat_attn:
         flags.append("feat_attn")
+    if args.dd_rope:
+        flags.append("dd_rope")
     if flags:
         print(f"  flags: +{'+'.join(flags)}")
     print(f"  params_total={total_params:,} params_trainable={trainable_params:,}")
