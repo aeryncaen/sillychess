@@ -64,91 +64,71 @@ def _apply_rotary(x, cos, sin):
 
 
 # ---------------------------------------------------------------------------
-# Data-dependent RoPE
-# ---------------------------------------------------------------------------
-
-class DDRoPE(nn.Module):
-    """Data-dependent RoPE on the second half of the head dim.
-
-    First half gets standard fixed-frequency RoPE (positional anchoring).
-    Second half gets DD-RoPE: cumsum of learned projection deltas from the
-    input, providing SSM-equivalent state tracking through cumulative phase
-    shifts.  No fixed RoPE on the DD half.
-
-    Args:
-        d_input:   Input dim (d_model).
-        n_heads:   Number of attention heads.
-        head_dim:  Dim per head.  Must be divisible by 4.
-    """
-
-    def __init__(self, d_input, n_heads, head_dim):
-        super().__init__()
-        assert head_dim % 4 == 0, f"head_dim must be divisible by 4 for dd-rope, got {head_dim}"
-        self.n_heads = n_heads
-        self.head_dim = head_dim
-        self.dd_pairs = head_dim // 4
-        self.dd_dim = self.dd_pairs * 2                # head_dim // 2
-
-        self.dd_proj = nn.Linear(d_input, n_heads * self.dd_pairs, bias=True)
-        nn.init.zeros_(self.dd_proj.weight)
-        nn.init.zeros_(self.dd_proj.bias)
-
-    def compute_angles(self, x):
-        """x: (B, T, D) -> (B, T, n_heads, dd_pairs) cumulative angles."""
-        B, T, _ = x.shape
-        deltas = self.dd_proj(x)                          # (B, T, n_heads * dd_pairs)
-        deltas = deltas.view(B, T, self.n_heads, self.dd_pairs)
-        return deltas.cumsum(dim=1)
-
-    def apply_hybrid(self, qk, dd_angles, fixed_cos, fixed_sin):
-        """Apply hybrid RoPE: fixed on first half, DD on second half.
-
-        Args:
-            qk:         (..., T, n_heads, head_dim)
-            dd_angles:  (B, T, n_heads, dd_pairs)
-            fixed_cos:  (1, T, 1, head_dim//2)
-            fixed_sin:  (1, T, 1, head_dim//2)
-
-        Returns:
-            Rotated tensor, same shape as qk.
-        """
-        fd = self.dd_dim                       # fixed half = dd_dim = head_dim // 2
-        fp = fd // 2                           # fixed rotation pairs
-
-        qk_fixed = qk[..., :fd]
-        qk_dd = qk[..., fd:]
-
-        qk_fixed = _apply_rotary(qk_fixed, fixed_cos[..., :fp], fixed_sin[..., :fp])
-        qk_dd = _apply_rotary(qk_dd, dd_angles.cos(), dd_angles.sin())
-
-        return torch.cat([qk_fixed, qk_dd], dim=-1)
-
-
-# ---------------------------------------------------------------------------
 # CausalLerp
 # ---------------------------------------------------------------------------
 
 class CausalLerp(nn.Module):
-    """Content-gated causal lerp across all dims.
+    """Content-gated causal lerp on first 50% of dims.
 
-    x_mixed[t] = (1 - gate) * x[t] + gate * x[t-1]
+    x_lerp[t] = (1 - gate) * x[t] + gate * x[t-1]
 
-    Gate is content-dependent.
+    Remaining dims pass through unchanged.  Gate reads the full d_model
+    but only gates the first half.
     Initialized near-identity (bias=-2.0 -> sigmoid ~ 0.12).
     """
 
-    def __init__(self, inner_dim, init_bias=-2.0):
+    def __init__(self, d_model, init_bias=-2.0):
         super().__init__()
-        self.inner_dim = inner_dim
-        self.gate_proj = nn.Linear(inner_dim, inner_dim, bias=True)
+        self.lerp_dim = d_model // 2
+        self.gate_proj = nn.Linear(d_model, self.lerp_dim, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, init_bias)
 
     def forward(self, x):
         """x: (B, T, D) -> same shape."""
-        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
+        x_lerp = x[..., :self.lerp_dim]
+        x_pass = x[..., self.lerp_dim:]
+        x_prev = F.pad(x_lerp[:, :-1], (0, 0, 1, 0))
         gate = torch.sigmoid(self.gate_proj(x))
-        return (1 - gate) * x + gate * x_prev
+        x_lerp = (1 - gate) * x_lerp + gate * x_prev
+        return torch.cat([x_lerp, x_pass], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Data-dependent RoPE (standalone, NOT inside attention)
+# ---------------------------------------------------------------------------
+
+class DDRoPE(nn.Module):
+    """Data-dependent cumulative rotation on first dd_dim dims.
+
+    Standalone state-tracking mechanism on the residual stream, inspired
+    by Mamba-3's complex-valued SSM (§3.2, Proposition 3).  Projects input
+    to per-timestep angle deltas, cumsums for cumulative phase, applies
+    rotation.  NOT applied to Q/K inside attention.
+
+    dd_dim is 50% of the CausalLerp dims = 25% of d_model.
+
+    Args:
+        d_input: Full model dim (reads all dims to compute angles).
+        dd_dim:  Number of dims to rotate (must be even).
+    """
+
+    def __init__(self, d_input, dd_dim):
+        super().__init__()
+        assert dd_dim % 2 == 0, f"dd_dim must be even, got {dd_dim}"
+        self.dd_dim = dd_dim
+        self.dd_pairs = dd_dim // 2
+        self.dd_proj = nn.Linear(d_input, self.dd_pairs, bias=True)
+        nn.init.zeros_(self.dd_proj.weight)
+        nn.init.zeros_(self.dd_proj.bias)
+
+    def forward(self, x):
+        """x: (B, T, D). Applies cumulative rotation to first dd_dim dims."""
+        deltas = self.dd_proj(x)               # (B, T, dd_pairs)
+        angles = deltas.cumsum(dim=1)          # cumulative phase
+        x_dd = x[..., :self.dd_dim]
+        x_dd = _apply_rotary(x_dd, angles.cos(), angles.sin())
+        return torch.cat([x_dd, x[..., self.dd_dim:]], dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +159,10 @@ class TransformerBlock(nn.Module):
             self.causal_lerp = CausalLerp(d_model)
 
         if use_dd_rope:
-            self.dd_rope = DDRoPE(d_input=d_model, n_heads=n_head, head_dim=self.d_head)
+            # 50% of lerp dims = 25% of d_model, rounded down to even
+            dd_dim = (d_model // 4) & ~1
+            assert dd_dim > 0, f"d_model too small for dd-rope: {d_model}"
+            self.dd_rope = DDRoPE(d_input=d_model, dd_dim=dd_dim)
 
         self.attn_norm = nn.RMSNorm(d_model)
         self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
@@ -208,23 +191,20 @@ class TransformerBlock(nn.Module):
         B, T, D = x.shape
         nh, dh = self.n_head, self.d_head
 
-        # Optional CausalLerp
+        # Pre-attention SSM: CausalLerp (50% dims) + DD-RoPE (25% dims)
         if self.use_lerp:
             x = self.causal_lerp(x)
+        if self.use_dd_rope:
+            x = self.dd_rope(x)
 
-        # Sequence attention
+        # Sequence attention (standard fixed RoPE on Q/K)
         h = self.attn_norm(x)
         qkv = self.w_qkv(h).reshape(B, T, 3, nh, dh)
         q, k, v = qkv.unbind(dim=2)               # (B, T, nh, dh)
         q = self.q_norm(q) * self.q_post_bias
         k = self.k_norm(k) * self.k_post_bias
-        if self.use_dd_rope:
-            dd_angles = self.dd_rope.compute_angles(x)
-            q = self.dd_rope.apply_hybrid(q, dd_angles, rope_cos, rope_sin)
-            k = self.dd_rope.apply_hybrid(k, dd_angles, rope_cos, rope_sin)
-        else:
-            q = _apply_rotary(q, rope_cos, rope_sin)
-            k = _apply_rotary(k, rope_cos, rope_sin)
+        q = _apply_rotary(q, rope_cos, rope_sin)
+        k = _apply_rotary(k, rope_cos, rope_sin)
         y = F.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
             is_causal=True,
