@@ -237,8 +237,18 @@ def _uci_to_chess_move(uci_str):
 
 
 def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
-    """Eval loss for UCI-mode model (single move head)."""
-    loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    """Eval loss for UCI-mode model (single move head).
+
+    Works for both windowed (has 'step' key) and full-game (PAD_ID=0) modes.
+    """
+    from sillychess.uci_vocab import PAD_ID
+    uci_plain = getattr(eval_dataset, 'uci_plain', False)
+    if uci_plain:
+        from sillychess.dataset import BucketBatchSampler
+        sampler = BucketBatchSampler(eval_dataset.bucket_ids, batch_size, shuffle=False)
+        loader = DataLoader(eval_dataset, batch_sampler=sampler)
+    else:
+        loader = DataLoader(eval_dataset, batch_size=batch_size, shuffle=True, drop_last=False)
     model.eval()
     total_loss = 0.0
     total_tokens = 0
@@ -251,23 +261,34 @@ def eval_loss_uci(model, eval_dataset, batch_size, device, max_batches=16):
             feat_y = {name: t.to(device) for name, t in feat_y.items()}
 
             logits = model(feat_x)  # (B, T, vocab_size)
-            uci_targets = feat_y["uci_move"]
-            pad_mask = feat_y["step"] != 0
-            valid = (uci_targets >= 0) & pad_mask
-            uci_targets_safe = uci_targets.clamp(min=0)
+            targets = feat_y["uci_move"]
 
-            raw = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                uci_targets_safe.reshape(-1),
-                reduction="none",
-            )
-            raw = raw.view(valid.shape)
-            n_valid = valid.float().sum().clamp_min(1.0)
-            batch_loss = (raw * valid.float()).sum() / n_valid
+            if uci_plain:
+                # Full-game: use ignore_index for PAD
+                batch_loss = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    targets.reshape(-1),
+                    ignore_index=PAD_ID,
+                )
+                n_tokens = (targets != PAD_ID).sum().item()
+            else:
+                # Windowed: mask by step != 0 and valid UCI targets
+                pad_mask = feat_y["step"] != 0
+                valid = (targets >= 0) & pad_mask
+                targets_safe = targets.clamp(min=0)
+                raw = torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    targets_safe.reshape(-1),
+                    reduction="none",
+                )
+                raw = raw.view(valid.shape)
+                n_valid = valid.float().sum().clamp_min(1.0)
+                batch_loss = (raw * valid.float()).sum() / n_valid
+                n_tokens = n_valid.item()
 
-            n_tokens = n_valid.item()
-            total_loss += batch_loss.item() * n_tokens
-            total_tokens += n_tokens
+            if n_tokens > 0:
+                total_loss += batch_loss.item() * n_tokens
+                total_tokens += n_tokens
 
     model.train()
     if total_tokens == 0:

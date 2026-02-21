@@ -148,8 +148,10 @@ class ChessMoveDataset(Dataset):
 
 
 class CachedChessDataset(Dataset):
-    def __init__(self, cache_dir, block_size, max_games=None, target_windows=None):
+    def __init__(self, cache_dir, block_size=128, max_games=None, target_windows=None,
+                 uci_plain=False, n_buckets=8, drop_above_percentile=99):
         self.block_size = block_size
+        self.uci_plain = uci_plain
         self.sequences = []
         self._target_windows = target_windows
         self._loaded_windows = 0
@@ -166,14 +168,19 @@ class CachedChessDataset(Dataset):
         else:
             raise ValueError("no shard-*.pt or shard-*.parquet files found in cache dir")
 
-        self.index = []
-        for g_idx, feature_seq in enumerate(
-            tqdm(self.sequences, desc="build windows", unit="game")
-        ):
-            length = len(feature_seq[next(iter(FEATURE_IDS))])
-            max_start = max(0, length - block_size - 1)
-            for start in range(max_start + 1):
-                self.index.append((g_idx, start))
+        if uci_plain:
+            # Full-game mode: bucket by length, no sliding windows
+            self._build_buckets(n_buckets, drop_above_percentile)
+        else:
+            # Window mode: sliding windows over feature sequences
+            self.index = []
+            for g_idx, feature_seq in enumerate(
+                tqdm(self.sequences, desc="build windows", unit="game")
+            ):
+                length = len(feature_seq[next(iter(FEATURE_IDS))])
+                max_start = max(0, length - block_size - 1)
+                for start in range(max_start + 1):
+                    self.index.append((g_idx, start))
 
     def _record_windows(self, length):
         self._loaded_windows += _windows_for_length(length, self.block_size)
@@ -224,24 +231,30 @@ class CachedChessDataset(Dataset):
             pbar.close()
 
     def _load_parquet_shards(self, shard_paths, max_games=None):
-        import pandas as pd
+        import pyarrow.parquet as pq
 
         count = 0
         feature_names = list(FEATURE_IDS.keys())
         pbar = tqdm(desc="load .parquet shards", unit="shard")
         try:
             for shard_path in shard_paths:
-                df = pd.read_parquet(shard_path)
-                has_uci = "uci_move" in df.columns
+                schema = pq.read_schema(shard_path)
+                cols_to_read = feature_names[:]
+                has_uci = "uci_move" in schema.names
+                if has_uci:
+                    cols_to_read.append("uci_move")
+                table = pq.read_table(shard_path, columns=cols_to_read)
+                # Extract columns as lists of arrays (one pylist call per column)
+                col_data = {name: table[name].to_pylist() for name in cols_to_read}
+                n_rows = len(col_data[feature_names[0]])
                 self.loaded_shards += 1
-                for idx in range(len(df)):
+                for idx in range(n_rows):
                     feature_seq = {}
                     for name in feature_names:
-                        val = df[name].iloc[idx]
+                        val = col_data[name][idx]
                         feature_seq[name] = np.asarray(val, dtype=np.int32) if val is not None else np.empty(0, dtype=np.int32)
                     if has_uci:
-                        val = df["uci_move"].iloc[idx]
-                        # Parquet stores 1-indexed; convert to 0-indexed
+                        val = col_data["uci_move"][idx]
                         feature_seq["uci_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
                     self.sequences.append(feature_seq)
                     count += 1
@@ -260,10 +273,96 @@ class CachedChessDataset(Dataset):
         finally:
             pbar.close()
 
+    def _build_buckets(self, n_buckets, drop_above_percentile):
+        """Compute bucket boundaries and per-game metadata for full-game mode."""
+        tok_lens = np.array([len(s["uci_move"]) + 2 for s in self.sequences])
+        max_len = int(np.percentile(tok_lens, drop_above_percentile))
+        kept_mask = tok_lens <= max_len
+        kept_lens = tok_lens[kept_mask]
+        percentiles = np.linspace(100 / n_buckets, 100, n_buckets)
+        raw_boundaries = np.percentile(kept_lens, percentiles).astype(int)
+        self.buckets = sorted(set(raw_boundaries.tolist()))
+
+        self.bucket_ids = []
+        self.padded_lens = []
+        self._kept_indices = []  # indices into self.sequences
+        self.dropped_games = 0
+        for i, seq in enumerate(self.sequences):
+            tl = tok_lens[i]
+            bid = None
+            for j, bmax in enumerate(self.buckets):
+                if tl <= bmax:
+                    bid = j
+                    break
+            if bid is None:
+                self.dropped_games += 1
+                continue
+            self._kept_indices.append(i)
+            self.bucket_ids.append(bid)
+            self.padded_lens.append(self.buckets[bid])
+
+    def split_eval(self, eval_fraction=0.1):
+        """Split into train/eval. Returns (train_ds, eval_ds)."""
+        if self.uci_plain:
+            n = len(self._kept_indices)
+        else:
+            n = len(self.sequences)
+        n_eval = max(1, int(n * eval_fraction))
+        n_train = n - n_eval
+
+        # Shallow-copy and slice
+        import copy
+        train_ds = copy.copy(self)
+        eval_ds = copy.copy(self)
+
+        if self.uci_plain:
+            train_ds._kept_indices = self._kept_indices[:n_train]
+            train_ds.bucket_ids = self.bucket_ids[:n_train]
+            train_ds.padded_lens = self.padded_lens[:n_train]
+            train_ds.loaded_games = n_train
+            eval_ds._kept_indices = self._kept_indices[n_train:]
+            eval_ds.bucket_ids = self.bucket_ids[n_train:]
+            eval_ds.padded_lens = self.padded_lens[n_train:]
+            eval_ds.loaded_games = n_eval
+        else:
+            eval_seqs = self.sequences[n_train:]
+            train_ds.sequences = self.sequences[:n_train]
+            train_ds.loaded_games = n_train
+            eval_ds.sequences = eval_seqs
+            eval_ds.loaded_games = n_eval
+            # Rebuild window indices
+            train_ds.index = [(g, s) for g, s in self.index if g < n_train]
+            eval_ds.index = [(g - n_train, s) for g, s in self.index if g >= n_train]
+
+        return train_ds, eval_ds
+
     def __len__(self):
+        if self.uci_plain:
+            return len(self._kept_indices)
         return len(self.index)
 
     def __getitem__(self, idx):
+        if self.uci_plain:
+            return self._getitem_uci_plain(idx)
+        return self._getitem_windowed(idx)
+
+    def _getitem_uci_plain(self, idx):
+        seq = self.sequences[self._kept_indices[idx]]
+        moves = seq["uci_move"]
+        padded_len = self.padded_lens[idx]
+
+        tokens = np.empty(padded_len, dtype=np.int64)
+        tokens[0] = BOG_ID
+        n = len(moves)
+        tokens[1:n + 1] = moves + MOVE_OFFSET
+        tokens[n + 1] = EOG_ID
+        if n + 2 < padded_len:
+            tokens[n + 2:] = PAD_ID
+
+        t = torch.from_numpy(tokens)
+        return {"uci_move": t[:-1]}, {"uci_move": t[1:]}
+
+    def _getitem_windowed(self, idx):
         g_idx, start = self.index[idx]
         feature_seq = self.sequences[g_idx]
         end = start + self.block_size + 1
@@ -281,7 +380,7 @@ class CachedChessDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Full-game dataset + bucket sampler for --uci-plain mode
+# Bucket sampler for full-game mode
 # ---------------------------------------------------------------------------
 
 class BucketBatchSampler(Sampler):
@@ -334,117 +433,4 @@ class BucketBatchSampler(Sampler):
         return total
 
 
-class FullGameDataset(Dataset):
-    """Full-game dataset for --uci-plain mode.
 
-    Each sample is one complete game tokenized as:
-        [BOG, move_0+OFFSET, move_1+OFFSET, ..., move_N+OFFSET, EOG, PAD...]
-
-    Input = tokens[:-1], target = tokens[1:].
-
-    Games are bucketed by length for efficient batching (all games in a
-    batch are padded to the same bucket length).
-    """
-
-    def __init__(self, cache_dir, max_games=None, n_buckets=8, max_drop_pct=1.0):
-        """
-        Args:
-            cache_dir: path to directory with shard-*.parquet files.
-            max_games: optional cap on number of games loaded.
-            n_buckets: number of length buckets (determined from data).
-            max_drop_pct: drop games above this percentile (default 1.0 = p99).
-        """
-        try:
-            import pyarrow.parquet as pq
-        except ImportError as exc:
-            raise ImportError(
-                "pyarrow is required for FullGameDataset. "
-                "Install with: pip install pyarrow"
-            ) from exc
-
-        cache_path = Path(cache_dir)
-        parquet_shards = sorted(cache_path.glob("shard-*.parquet"))
-        if not parquet_shards:
-            raise ValueError(f"no shard-*.parquet files found in {cache_dir}")
-
-        # --- Pass 1: load all games, compute token lengths ---
-        import pandas as pd
-        all_moves = []   # list of np.ndarray (int32, 0-indexed)
-        for shard_path in parquet_shards:
-            df = pd.read_parquet(shard_path, columns=["uci_move"])
-            for val in df["uci_move"]:
-                if val is None:
-                    continue
-                arr = np.asarray(val, dtype=np.int32)
-                mask = arr > 0
-                if not mask.any():
-                    continue
-                # 1-indexed parquet → 0-indexed
-                all_moves.append(arr[mask] - 1)
-                if max_games is not None and len(all_moves) >= max_games:
-                    break
-            if max_games is not None and len(all_moves) >= max_games:
-                break
-
-        # Token length per game: BOG + moves + EOG
-        tok_lens = [len(m) + 2 for m in all_moves]
-
-        # --- Compute bucket boundaries from data ---
-        sorted_lens = sorted(tok_lens)
-        n_total = len(sorted_lens)
-        # Drop above max_drop_pct percentile
-        cutoff_idx = max(1, int(n_total * (1.0 - max_drop_pct / 100.0)))
-        max_len = sorted_lens[-cutoff_idx] if cutoff_idx <= n_total else sorted_lens[-1]
-        # Quantile-based bucket boundaries so each bucket has ~equal games
-        bucket_boundaries = []
-        for i in range(1, n_buckets + 1):
-            pct_idx = int(n_total * i / n_buckets) - 1
-            pct_idx = min(pct_idx, n_total - 1)
-            boundary = sorted_lens[pct_idx]
-            if boundary > max_len:
-                boundary = max_len
-            if not bucket_boundaries or boundary > bucket_boundaries[-1]:
-                bucket_boundaries.append(boundary)
-        self.buckets = bucket_boundaries
-
-        # --- Pass 2: assign games to buckets ---
-        self.games = []
-        self.bucket_ids = []
-        self.padded_lens = []
-        dropped = 0
-        for moves in all_moves:
-            tok_len = len(moves) + 2
-            bid = None
-            for i, bmax in enumerate(self.buckets):
-                if tok_len <= bmax:
-                    bid = i
-                    break
-            if bid is None:
-                dropped += 1
-                continue
-            self.games.append(moves)
-            self.bucket_ids.append(bid)
-            self.padded_lens.append(self.buckets[bid])
-
-        self.loaded_games = len(self.games)
-        self.dropped_games = dropped
-        self.sequences = None  # not used in full-game mode
-
-    def __len__(self):
-        return len(self.games)
-
-    def __getitem__(self, idx):
-        moves = self.games[idx]
-        padded_len = self.padded_lens[idx]
-
-        # Build token sequence: [BOG, move+OFFSET, ..., EOG, PAD...]
-        tokens = np.empty(padded_len, dtype=np.int64)
-        tokens[0] = BOG_ID
-        n = len(moves)
-        tokens[1:n + 1] = moves + MOVE_OFFSET
-        tokens[n + 1] = EOG_ID
-        if n + 2 < padded_len:
-            tokens[n + 2:] = PAD_ID
-
-        t = torch.from_numpy(tokens)
-        return {"uci_move": t[:-1]}, {"uci_move": t[1:]}

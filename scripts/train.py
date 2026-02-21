@@ -9,7 +9,6 @@ from sillychess.dataset import (
     BucketBatchSampler,
     CachedChessDataset,
     ChessMoveDataset,
-    FullGameDataset,
     iter_jsonl_games,
     iter_pgn_games,
 )
@@ -111,96 +110,58 @@ def main():
                         help="enable CausalLerp in --uci-plain blocks")
     parser.add_argument("--feat-attn", action="store_true",
                         help="replace SwiGLU with feature attention in --uci-plain blocks")
-    parser.add_argument("--full-games", action="store_true",
-                        help="full-game training: each sample = complete game (requires --uci-plain)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--save-model", default="model.pt")
     args = parser.parse_args()
 
     device = resolve_device(args.device)
+    if args.uci_plain:
+        args.uci = True
+
     print("init: resolving dataset...")
     target_windows = args.steps * args.batch_size
-    print(f"init: target_windows={target_windows}")
     winner_only = args.perspective == "winner"
 
-    full_game_mode = args.full_games
-    if full_game_mode and not args.uci_plain:
-        raise ValueError("--full-games requires --uci-plain")
-
-    if full_game_mode:
-        # --- Full-game dataset ---
-        if not args.cache_dir:
-            raise ValueError("--full-games requires --cache-dir with parquet shards")
-        dataset = FullGameDataset(
-            args.cache_dir,
-            max_games=None,
-        )
-        print(
-            f"init: full-game dataset ready — "
-            f"{dataset.loaded_games} games, {dataset.dropped_games} dropped, "
-            f"buckets={dataset.buckets}"
-        )
-        # Simple eval split: take first 10% of games
-        n_eval = max(1, int(len(dataset) * 0.1))
-        # Full-game mode doesn't use window-based eval; we'll compute eval loss only
-        train_dataset = dataset
-        eval_dataset = None
-        eval_sequences = []
-        print(f"init: full-game mode — eval via train-set loss sampling (no legality eval yet)")
-
-        sampler = BucketBatchSampler(dataset.bucket_ids, args.batch_size, shuffle=True)
-        loader = DataLoader(dataset, batch_sampler=sampler)
-    elif args.cache_dir:
+    if args.cache_dir:
         dataset = CachedChessDataset(
             args.cache_dir,
-            args.block_size,
+            block_size=args.block_size,
             max_games=None,
             target_windows=target_windows,
+            uci_plain=args.uci_plain,
         )
-        print("init: dataset ready")
-        if hasattr(dataset, "loaded_shards"):
-            print(
-                "init: cache stats",
-                f"loaded_shards={dataset.loaded_shards}",
-                f"loaded_games={dataset.loaded_games}",
-                f"loaded_windows={getattr(dataset, '_loaded_windows', 'n/a')}",
-            )
+        print(
+            f"init: dataset ready — "
+            f"shards={dataset.loaded_shards} games={dataset.loaded_games}"
+        )
+        if dataset.uci_plain:
+            print(f"init: buckets={dataset.buckets} dropped={dataset.dropped_games}")
 
-        # Split 10% of games for eval
-        if hasattr(dataset, "sequences") and len(dataset.sequences) >= 10:
-            train_dataset, eval_dataset = split_eval(dataset, eval_fraction=0.1)
-            eval_sequences = eval_dataset.sequences
-            print(
-                f"init: split train={len(train_dataset)} windows "
-                f"({train_dataset.loaded_games} games), "
-                f"eval={len(eval_dataset)} windows "
-                f"({eval_dataset.loaded_games} games)"
-            )
+        # Split train/eval
+        if len(dataset.sequences) >= 10:
+            train_dataset, eval_dataset = dataset.split_eval(eval_fraction=0.1)
+            print(f"init: train={len(train_dataset)} eval={len(eval_dataset)}")
         else:
             train_dataset = dataset
             eval_dataset = None
-            eval_sequences = []
             print("init: too few games to split, no eval set")
 
-        loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        if dataset.uci_plain:
+            sampler = BucketBatchSampler(train_dataset.bucket_ids, args.batch_size, shuffle=True)
+            loader = DataLoader(train_dataset, batch_sampler=sampler)
+        else:
+            loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
     else:
         if not args.data:
             raise ValueError("--data is required when not using --cache-dir")
         games = load_games(
-            args.data,
-            args.format,
-            args.perspective,
-            winner_only=winner_only,
-            max_games=None,
+            args.data, args.format, args.perspective,
+            winner_only=winner_only, max_games=None,
         )
         dataset = ChessMoveDataset(games, args.block_size, target_windows=target_windows)
         print("init: dataset ready")
-
         train_dataset = dataset
         eval_dataset = None
-        eval_sequences = []
-        print("init: too few games to split, no eval set")
-
         loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     if args.uci_plain:
@@ -208,9 +169,9 @@ def main():
 
     print("init: building model...")
     if args.uci_plain:
-        vocab_size = UCI_PLAIN_VOCAB_SIZE if full_game_mode else UCI_VOCAB_SIZE
+        vocab_size = UCI_PLAIN_VOCAB_SIZE
         # Block size for full-game mode = largest bucket - 1 (input is bucket_len - 1)
-        block_size = max(dataset.buckets) - 1 if full_game_mode else args.block_size
+        block_size = max(dataset.buckets) - 1 if dataset.uci_plain else args.block_size
         model = PlainTransformerModel(
             block_size=block_size,
             d_model=args.w_dim,
@@ -241,9 +202,7 @@ def main():
         print(f"init: model ready (2D, uci_mode={model.uci_mode})")
 
     total_params, trainable_params = count_parameters(model)
-    if full_game_mode:
-        game_count = dataset.loaded_games
-    elif hasattr(dataset, "sequences") and dataset.sequences is not None:
+    if hasattr(dataset, "sequences") and dataset.sequences is not None:
         game_count = len(dataset.sequences)
     else:
         game_count = "unknown"
@@ -255,7 +214,7 @@ def main():
         f"params_total={total_params:,}",
         f"params_trainable={trainable_params:,}",
     )
-    if full_game_mode:
+    if args.uci_plain:
         print(
             "model:",
             f"block_size={block_size}",
@@ -341,8 +300,7 @@ def main():
 
             outputs = model(feat_x)
 
-            if full_game_mode:
-                # Full-game mode: targets are token IDs, PAD_ID=0 is ignored
+            if args.uci_plain:
                 targets = feat_y["uci_move"]
                 loss = torch.nn.functional.cross_entropy(
                     outputs.reshape(-1, outputs.size(-1)),
@@ -399,27 +357,32 @@ def main():
             step += 1
 
             # --- Eval ---
-            if full_game_mode and step % args.eval_every == 0:
-                # Full-game mode: no separate eval set yet, just report train loss
-                tqdm.write(f"  step={step}: train_loss={loss.item():.4f}")
-            elif eval_dataset is not None and step % args.eval_every == 0:
-                if args.uci:
+            if eval_dataset is not None and step % args.eval_every == 0:
+                if args.uci_plain:
+                    val = eval_loss_uci(model, eval_dataset, args.batch_size, device)
+                    tqdm.write(f"  eval step={step}: val_loss={val:.4f}")
+                elif args.uci:
                     val = eval_loss_uci(model, eval_dataset, args.batch_size, device)
                     leg, leg_total = eval_legality_uci(
-                        model, eval_sequences, args.block_size, device,
+                        model, eval_dataset.sequences, args.block_size, device,
                         max_games=args.eval_legality_games,
+                    )
+                    leg_pct = 100.0 * leg / max(1, leg_total)
+                    tqdm.write(
+                        f"  eval step={step}: val_loss={val:.4f} "
+                        f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
                     )
                 else:
                     val = eval_loss(model, eval_dataset, args.batch_size, device)
                     leg, leg_total = eval_legality(
-                        model, eval_sequences, args.block_size, device,
+                        model, eval_dataset.sequences, args.block_size, device,
                         max_games=args.eval_legality_games,
                     )
-                leg_pct = 100.0 * leg / max(1, leg_total)
-                tqdm.write(
-                    f"  eval step={step}: val_loss={val:.4f} "
-                    f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
-                )
+                    leg_pct = 100.0 * leg / max(1, leg_total)
+                    tqdm.write(
+                        f"  eval step={step}: val_loss={val:.4f} "
+                        f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
+                    )
     finally:
         pbar.close()
 
