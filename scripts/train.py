@@ -236,6 +236,7 @@ def main():
             feat_y = {name: tensor.to(device) for name, tensor in feat_y.items()}
 
             outputs = model(feat_x)
+            train_acc = None
 
             if args.uci_plain:
                 targets = feat_y["uci_move"]
@@ -244,6 +245,9 @@ def main():
                     targets.reshape(-1),
                     ignore_index=PAD_ID,
                 )
+                mask = targets != PAD_ID
+                preds = outputs.argmax(dim=-1)
+                train_acc = ((preds == targets) & mask).sum().item() / mask.sum().clamp_min(1).item()
             elif args.uci:
                 pad_mask = (feat_y["step"] != 0).float()
                 uci_targets = feat_y["uci_move"]
@@ -256,12 +260,16 @@ def main():
                 )
                 raw = raw.view(pad_mask.shape)
                 loss = (raw * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+                preds = outputs.argmax(dim=-1)
+                train_acc = ((preds == uci_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
             else:
                 pad_mask = (feat_y["step"] != 0).float()
                 denom = pad_mask.sum().clamp_min(1.0)
                 # Extract per-feature targets from stacked (B, T, 9) tensor
                 feat_targets = feat_y["features"]
                 feature_losses = []
+                n_correct = 0
+                n_predictions = 0
                 for i, name in enumerate(FEATURE_ORDER):
                     logits = outputs[name]
                     targets = feat_targets[:, :, i]
@@ -272,10 +280,14 @@ def main():
                     )
                     raw = raw.view(pad_mask.shape)
                     feature_losses.append((raw * pad_mask).sum() / denom)
+                    preds = logits.argmax(dim=-1)
+                    n_correct += ((preds == targets) & (pad_mask > 0)).sum().item()
+                    n_predictions += denom.item()
                 # Contraharmonic mean: sum(L_i^2) / sum(L_i)
                 # Upweights harder features, prevents fast learners from dominating
                 stacked = torch.stack(feature_losses)
                 loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
+                train_acc = n_correct / max(1, n_predictions)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None
@@ -284,17 +296,11 @@ def main():
             optimizer.step()
             scheduler.step()
 
+            postfix = {"loss": f"{loss.item():.4f}", "acc": f"{train_acc:.3f}"}
             if grad_norm is not None:
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    grad=f"{float(grad_norm):.3f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                )
-            else:
-                pbar.set_postfix(
-                    loss=f"{loss.item():.4f}",
-                    lr=f"{optimizer.param_groups[0]['lr']:.2e}",
-                )
+                postfix["grad"] = f"{float(grad_norm):.3f}"
+            postfix["lr"] = f"{optimizer.param_groups[0]['lr']:.2e}"
+            pbar.set_postfix(**postfix)
             pbar.update(1)
             step += 1
 
@@ -312,14 +318,14 @@ def main():
                         f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
                     )
                 else:
-                    val = eval_loss(model, eval_dataset, args.batch_size, device)
+                    val, acc = eval_loss(model, eval_dataset, args.batch_size, device)
                     leg, leg_total = eval_legality(
                         model, eval_dataset.sequences, device,
                         max_games=args.eval_legality_games,
                     )
                     leg_pct = 100.0 * leg / max(1, leg_total)
                     tqdm.write(
-                        f"  eval step={step}: val_loss={val:.4f} "
+                        f"  eval step={step}: val_loss={val:.4f} acc={acc:.3f} "
                         f"legality={leg}/{leg_total} ({leg_pct:.1f}%)"
                     )
     finally:

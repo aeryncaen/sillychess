@@ -19,6 +19,8 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
     loader = DataLoader(eval_dataset, batch_sampler=sampler)
     model.eval()
     total_loss = 0.0
+    total_correct = 0
+    total_predictions = 0
     total_tokens = 0
 
     with torch.no_grad():
@@ -34,9 +36,9 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
 
             feat_targets = feat_y["features"]
             feature_losses = []
-            for i, name in enumerate(FEATURE_ORDER):
+            for fi, name in enumerate(FEATURE_ORDER):
                 logits = outputs[name]
-                targets = feat_targets[:, :, i]
+                targets = feat_targets[:, :, fi]
                 raw = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     targets.reshape(-1),
@@ -44,6 +46,9 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
                 )
                 raw = raw.view(pad_mask.shape)
                 feature_losses.append((raw * pad_mask).sum() / denom)
+                preds = logits.argmax(dim=-1)
+                total_correct += ((preds == targets) & (pad_mask > 0)).sum().item()
+                total_predictions += denom.item()
 
             # Contraharmonic mean (matches train.py)
             stacked = torch.stack(feature_losses)
@@ -54,8 +59,8 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
 
     model.train()
     if total_tokens == 0:
-        return float("nan")
-    return total_loss / total_tokens
+        return float("nan"), 0.0
+    return total_loss / total_tokens, total_correct / max(1, total_predictions)
 
 
 # Reverse lookups for legality checking
