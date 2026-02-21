@@ -10,6 +10,7 @@ dependencies = [
   "torch",
   "python-chess",
   "pyarrow",
+  "pandas",
   "numpy",
   "tqdm",
 ]

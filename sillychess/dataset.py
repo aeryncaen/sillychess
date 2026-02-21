@@ -231,40 +231,35 @@ class CachedChessDataset(Dataset):
             pbar.close()
 
     def _load_parquet_shards(self, shard_paths, max_games=None):
-        import pyarrow.parquet as pq
+        import pandas as pd
 
-        count = 0
         feature_names = list(FEATURE_IDS.keys())
         pbar = tqdm(desc="load .parquet shards", unit="shard")
         try:
             for shard_path in shard_paths:
-                schema = pq.read_schema(shard_path)
-                cols_to_read = feature_names[:]
-                has_uci = "uci_move" in schema.names
-                if has_uci:
-                    cols_to_read.append("uci_move")
-                table = pq.read_table(shard_path, columns=cols_to_read)
-                # Extract columns as lists of arrays (one pylist call per column)
-                col_data = {name: table[name].to_pylist() for name in cols_to_read}
-                n_rows = len(col_data[feature_names[0]])
+                df = pd.read_parquet(shard_path)
+                has_uci = "uci_move" in df.columns
+                cols = feature_names + (["uci_move"] if has_uci else [])
+                # .values gives object array of numpy arrays — no Python int conversion
+                col_arrays = {name: df[name].values for name in cols}
+                n_rows = len(df)
                 self.loaded_shards += 1
                 for idx in range(n_rows):
                     feature_seq = {}
                     for name in feature_names:
-                        val = col_data[name][idx]
+                        val = col_arrays[name][idx]
                         feature_seq[name] = np.asarray(val, dtype=np.int32) if val is not None else np.empty(0, dtype=np.int32)
                     if has_uci:
-                        val = col_data["uci_move"][idx]
+                        val = col_arrays["uci_move"][idx]
                         feature_seq["uci_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
                     self.sequences.append(feature_seq)
-                    count += 1
                     self.loaded_games += 1
                     seq_len = len(feature_seq[feature_names[0]])
                     if self._record_windows(seq_len):
                         pbar.update(1)
                         pbar.set_postfix(games=self.loaded_games, windows=self._loaded_windows, target=self._target_windows, stop="target")
                         return
-                    if max_games is not None and count >= max_games:
+                    if max_games is not None and self.loaded_games >= max_games:
                         pbar.update(1)
                         pbar.set_postfix(games=self.loaded_games, windows=self._loaded_windows, target=self._target_windows, stop="max_games")
                         return
