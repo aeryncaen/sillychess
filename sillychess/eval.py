@@ -32,8 +32,8 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
             pad_mask = (feat_y["step"] != 0).float()
             denom = pad_mask.sum().clamp_min(1.0)
 
-            batch_loss = 0.0
             feat_targets = feat_y["features"]
+            feature_losses = []
             for i, name in enumerate(FEATURE_ORDER):
                 logits = outputs[name]
                 targets = feat_targets[:, :, i]
@@ -43,9 +43,11 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
                     reduction="none",
                 )
                 raw = raw.view(pad_mask.shape)
-                batch_loss += (raw * pad_mask).sum() / denom
+                feature_losses.append((raw * pad_mask).sum() / denom)
 
-            batch_loss = batch_loss / len(outputs)
+            # Contraharmonic mean (matches train.py)
+            stacked = torch.stack(feature_losses)
+            batch_loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
             n_tokens = denom.item()
             total_loss += batch_loss.item() * n_tokens
             total_tokens += n_tokens
@@ -105,19 +107,12 @@ def eval_legality(model, eval_sequences, device, max_games=50):
 
             out = model(feat_x)  # dict of {name: (1, T, n_classes)}
 
-            # Replay board and check legality at each position
+            # Replay board and check legality at each position.
+            # Output at position t predicts move t+1 (next-token prediction),
+            # so push actual move t BEFORE checking the prediction.
             board = chess.Board()
             for t in range(seq_len - 1):
-                from_id = out["from_square"][0, t].argmax(-1).item()
-                to_id = out["to_square"][0, t].argmax(-1).item()
-                promo_id = out["promotion"][0, t].argmax(-1).item()
-
-                move = _id_to_move(from_id, to_id, promo_id)
-                if move is not None and move in board.legal_moves:
-                    legal += 1
-                total += 1
-
-                # Advance board with actual move
+                # Push actual move t to advance board to post-move-t state
                 try:
                     actual_from = _FROM_SQUARES[game_seq["from_square"][t]]
                     actual_to = _TO_SQUARES[game_seq["to_square"][t]]
@@ -131,6 +126,16 @@ def eval_legality(model, eval_sequences, device, max_games=50):
                     board.push(actual_move)
                 except (ValueError, AssertionError):
                     break
+
+                # Now check: is the model's predicted next move legal here?
+                from_id = out["from_square"][0, t].argmax(-1).item()
+                to_id = out["to_square"][0, t].argmax(-1).item()
+                promo_id = out["promotion"][0, t].argmax(-1).item()
+
+                move = _id_to_move(from_id, to_id, promo_id)
+                if move is not None and move in board.legal_moves:
+                    legal += 1
+                total += 1
 
     model.train()
     return legal, total
@@ -246,24 +251,22 @@ def eval_legality_uci(model, eval_sequences, device, max_games=50):
 
             logits = model(feat_x)  # (1, T, vocab_size)
 
-            # Replay board and check legality at each position
+            # Replay board and check legality at each position.
+            #
+            # Plain mode: input[t] = BOG (t=0) or move_{t-1}+offset (t>0).
+            #   Output[t] predicts move_t.  Check BEFORE pushing move_t.
+            #
+            # Composite mode: input[t] = features of move_t.
+            #   Output[t] predicts move_{t+1}.  Push move_t BEFORE checking.
             board = chess.Board()
             for t in range(seq_len - 1):
                 if is_plain:
-                    # Position t+1 in token seq (after BOG) predicts move t+1
-                    # Position t in token seq was fed move t, output predicts move t+1
-                    # But we want to check what the model predicts for move t
-                    # Input token[t] = BOG (t=0) or move_{t-1}+offset (t>0)
-                    # Output logit[t] predicts the next token = move_t+offset
                     uci_id = logits[0, t].argmax(-1).item() - MOVE_OFFSET
-                else:
-                    uci_id = logits[0, t].argmax(-1).item()
-
-                uci_str = UCI_MOVES[uci_id] if 0 <= uci_id < len(UCI_MOVES) else None
-                move = _uci_to_chess_move(uci_str)
-                if move is not None and move in board.legal_moves:
-                    legal += 1
-                total += 1
+                    uci_str = UCI_MOVES[uci_id] if 0 <= uci_id < len(UCI_MOVES) else None
+                    move = _uci_to_chess_move(uci_str)
+                    if move is not None and move in board.legal_moves:
+                        legal += 1
+                    total += 1
 
                 # Advance board with actual move
                 try:
@@ -279,6 +282,14 @@ def eval_legality_uci(model, eval_sequences, device, max_games=50):
                     board.push(actual_move)
                 except (ValueError, AssertionError):
                     break
+
+                if not is_plain:
+                    uci_id = logits[0, t].argmax(-1).item()
+                    uci_str = UCI_MOVES[uci_id] if 0 <= uci_id < len(UCI_MOVES) else None
+                    move = _uci_to_chess_move(uci_str)
+                    if move is not None and move in board.legal_moves:
+                        legal += 1
+                    total += 1
 
     model.train()
     return legal, total

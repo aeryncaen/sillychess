@@ -272,7 +272,10 @@ def main():
                     )
                     raw = raw.view(pad_mask.shape)
                     feature_losses.append((raw * pad_mask).sum() / denom)
-                loss = sum(feature_losses) / len(feature_losses)
+                # Contraharmonic mean: sum(L_i^2) / sum(L_i)
+                # Upweights harder features, prevents fast learners from dominating
+                stacked = torch.stack(feature_losses)
+                loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None

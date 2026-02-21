@@ -254,18 +254,21 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class FeatureOutputHead(nn.Module):
-    """Per-feature linear classifiers.
+    """Per-feature classifiers with weights tied to the input embedding.
 
     Input: (B, T, total_rows, DD).  Output: dict of {feature_name: (B, T, n_classes)}.
+
+    Each feature's classifier reuses the corresponding rows of the shared
+    embedding table — same idea as LM head weight tying.
     """
 
-    def __init__(self, feature_sizes, rows_per_feature, desc_dim):
+    def __init__(self, feature_sizes, rows_per_feature, embed_weight, offsets):
         super().__init__()
         self.feature_names = list(feature_sizes.keys())
+        self.sizes = [feature_sizes[n] for n in self.feature_names]
         self.rows_per_feature = rows_per_feature
-        self.classifiers = nn.ModuleDict()
-        for name, n_classes in feature_sizes.items():
-            self.classifiers[name] = nn.Linear(rows_per_feature * desc_dim, n_classes)
+        self.embed_weight = embed_weight  # reference, not a copy
+        self.offsets = offsets             # (n_features,) int64 buffer
 
     def forward(self, x):
         """x: (B, T, total_rows, DD) -> dict of {name: (B, T, n_classes)}"""
@@ -274,8 +277,10 @@ class FeatureOutputHead(nn.Module):
         for idx, name in enumerate(self.feature_names):
             start = idx * rpf
             chunk = x[:, :, start:start + rpf, :]
-            flat = chunk.reshape(x.shape[0], x.shape[1], -1)
-            outputs[name] = self.classifiers[name](flat)
+            flat = chunk.reshape(x.shape[0], x.shape[1], -1)    # (B, T, rpf*DD)
+            w = self.embed_weight[self.offsets[idx]:self.offsets[idx] + self.sizes[idx]]  # (n_classes, rpf*DD)
+            w = F.normalize(w, dim=-1)
+            outputs[name] = F.linear(flat, w)
         return outputs
 
 
@@ -349,7 +354,10 @@ class TransformerModel(nn.Module):
         elif self.uci_mode:
             self.head = nn.Linear(d_model, uci_vocab_size, bias=False)
         else:
-            self.output_head = FeatureOutputHead(feature_sizes, rows_per_feature, w_dim)
+            self.output_head = FeatureOutputHead(
+                feature_sizes, rows_per_feature,
+                self.embed.embed.weight, self.embed.offsets,
+            )
 
         self._init_weights(n_layer)
 
