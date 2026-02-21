@@ -107,10 +107,12 @@ def main():
                         help="plain 1D transformer: UCI tokens in, UCI tokens out")
     parser.add_argument("--n-head", type=int, default=4,
                         help="attention heads for --uci-plain (d_model must be divisible)")
+    parser.add_argument("--lerp", action="store_true",
+                        help="enable CausalLerp in --uci-plain blocks")
+    parser.add_argument("--feat-attn", action="store_true",
+                        help="replace SwiGLU with feature attention in --uci-plain blocks")
     parser.add_argument("--full-games", action="store_true",
                         help="full-game training: each sample = complete game (requires --uci-plain)")
-    parser.add_argument("--buckets", type=str, default="40,80,120,200,350",
-                        help="comma-separated bucket max-lengths for --full-games (run analyze_shards.py first)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--save-model", default="model.pt")
     args = parser.parse_args()
@@ -122,7 +124,6 @@ def main():
     winner_only = args.perspective == "winner"
 
     full_game_mode = args.full_games
-    bucket_list = [int(x) for x in args.buckets.split(",")] if full_game_mode else []
     if full_game_mode and not args.uci_plain:
         raise ValueError("--full-games requires --uci-plain")
 
@@ -132,13 +133,12 @@ def main():
             raise ValueError("--full-games requires --cache-dir with parquet shards")
         dataset = FullGameDataset(
             args.cache_dir,
-            buckets=bucket_list,
             max_games=None,
         )
         print(
             f"init: full-game dataset ready — "
-            f"{dataset.loaded_games} games, {dataset.dropped_games} dropped "
-            f"(>{max(bucket_list)} tokens), buckets={bucket_list}"
+            f"{dataset.loaded_games} games, {dataset.dropped_games} dropped, "
+            f"buckets={dataset.buckets}"
         )
         # Simple eval split: take first 10% of games
         n_eval = max(1, int(len(dataset) * 0.1))
@@ -210,7 +210,7 @@ def main():
     if args.uci_plain:
         vocab_size = UCI_PLAIN_VOCAB_SIZE if full_game_mode else UCI_VOCAB_SIZE
         # Block size for full-game mode = largest bucket - 1 (input is bucket_len - 1)
-        block_size = max(bucket_list) - 1 if full_game_mode else args.block_size
+        block_size = max(dataset.buckets) - 1 if full_game_mode else args.block_size
         model = PlainTransformerModel(
             block_size=block_size,
             d_model=args.w_dim,
@@ -218,8 +218,16 @@ def main():
             n_layer=args.n_layer,
             vocab_size=vocab_size,
             dropout=args.dropout,
+            use_lerp=args.lerp,
+            use_feat_attn=args.feat_attn,
         ).to(device)
-        print(f"init: model ready (plain 1D, d_model={args.w_dim}, n_head={args.n_head}, vocab={vocab_size})")
+        flags = []
+        if args.lerp:
+            flags.append("lerp")
+        if args.feat_attn:
+            flags.append("feat_attn")
+        flag_str = f" +{'+'.join(flags)}" if flags else ""
+        print(f"init: model ready (plain 1D, d_model={args.w_dim}, n_head={args.n_head}, vocab={vocab_size}{flag_str})")
     else:
         model = TwoStageTransformerModel(
             block_size=args.block_size,

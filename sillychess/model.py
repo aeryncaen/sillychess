@@ -102,24 +102,26 @@ class CausalLerp(nn.Module):
     Initialized near-identity (bias=-2.0 → sigmoid ≈ 0.12).
     """
 
-    def __init__(self, n_features, inner_dim, init_bias=-2.0):
+    def __init__(self, inner_dim, init_bias=-2.0):
         super().__init__()
         self.half_dim = inner_dim // 2
-        # Gate projection: per-feature, projects descriptor to half_dim gate
         self.gate_proj = nn.Linear(inner_dim, self.half_dim, bias=True)
         nn.init.zeros_(self.gate_proj.weight)
         nn.init.constant_(self.gate_proj.bias, init_bias)
 
     def forward(self, x):
-        """x: (B, T, NF, ID) -> (B, T, NF, ID)"""
+        """x: (B, T, ..., D) -> same shape. Works for 3D (B,T,D) or 4D (B,T,NF,D)."""
         hd = self.half_dim
-        x_static = x[..., :hd]                                # first half — untouched
-        x_cur = x[..., hd:]                                   # last half — lerped
+        x_static = x[..., :hd]
+        x_cur = x[..., hd:]
 
-        # Shift x_cur one step back: pad t=0 with zeros
-        x_prev = F.pad(x_cur[:, :-1], (0, 0, 0, 0, 1, 0))   # (B, T, NF, hd)
+        # Shift x_cur one step back along dim 1: pad t=0 with zeros
+        # Build pad spec: 0 on last dim, then 0 on any middle dims, then (1,0) on time
+        n_trailing = x.ndim - 2  # dims after the time dim
+        pad = (0, 0) * n_trailing + (1, 0)
+        x_prev = F.pad(x_cur[:, :-1], pad)
 
-        gate = torch.sigmoid(self.gate_proj(x))                # (B, T, NF, hd)
+        gate = torch.sigmoid(self.gate_proj(x))
         x_mixed = (1 - gate) * x_cur + gate * x_prev
         return torch.cat([x_static, x_mixed], dim=-1)
 
@@ -141,7 +143,7 @@ class ChessBlock(nn.Module):
         FFN_DD = ((DD * 8 // 3 + 7) // 8) * 8
 
         # --- Causal lerp: SSM-style temporal mixing on half of DD ---
-        self.causal_lerp = CausalLerp(NF, DD)
+        self.causal_lerp = CausalLerp(DD)
 
         # --- Sequence attention (per-feature QKV on descriptor dim) ---
         init_scale = DD ** -0.5
@@ -284,30 +286,55 @@ class FeatureOutputHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class PlainBlock(nn.Module):
-    """Standard pre-norm transformer block: causal SDPA + SwiGLU MLP."""
+    """Pre-norm transformer block with optional CausalLerp and feature attention.
 
-    def __init__(self, d_model, n_head, dropout=0.1):
+    Base: causal SDPA + SwiGLU MLP.
+    --lerp: adds CausalLerp before attention (SSM-style temporal mixing).
+    --feat-attn: replaces SwiGLU gate with softmax attention over n_head
+                 "features" (same mechanism as ChessBlock's feature attention).
+    """
+
+    def __init__(self, d_model, n_head, dropout=0.1, use_lerp=False, use_feat_attn=False):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
         self.d_head = d_model // n_head
+        self.use_lerp = use_lerp
+        self.use_feat_attn = use_feat_attn
+
+        if use_lerp:
+            self.causal_lerp = CausalLerp(d_model)
 
         self.attn_norm = nn.RMSNorm(d_model)
         self.w_qkv = nn.Linear(d_model, 3 * d_model, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.attn_drop = nn.Dropout(dropout)
 
-        self.mlp_norm = nn.RMSNorm(d_model)
         ffn_dim = ((d_model * 8 // 3 + 7) // 8) * 8
-        self.gate_proj = nn.Linear(d_model, ffn_dim, bias=False)
-        self.up_proj = nn.Linear(d_model, ffn_dim, bias=False)
-        self.down_proj = nn.Linear(ffn_dim, d_model, bias=False)
+        self.mlp_norm = nn.RMSNorm(d_model)
+
+        if use_feat_attn:
+            # Feature-attention MLP: gate_proj -> shared Q=K, up_proj -> V,
+            # softmax attention over n_head features, then down_proj.
+            self.feat_gate = nn.Linear(d_model, ffn_dim, bias=False)
+            self.feat_up = nn.Linear(d_model, ffn_dim, bias=False)
+            self.feat_down = nn.Linear(ffn_dim, d_model, bias=False)
+            self.feat_qk_norm = nn.RMSNorm(ffn_dim // n_head)
+        else:
+            self.gate_proj = nn.Linear(d_model, ffn_dim, bias=False)
+            self.up_proj = nn.Linear(d_model, ffn_dim, bias=False)
+            self.down_proj = nn.Linear(ffn_dim, d_model, bias=False)
         self.mlp_drop = nn.Dropout(dropout)
 
     def forward(self, x, rope_cos, rope_sin):
         B, T, D = x.shape
         nh, dh = self.n_head, self.d_head
 
+        # Optional CausalLerp
+        if self.use_lerp:
+            x = self.causal_lerp(x)
+
+        # Sequence attention
         h = self.attn_norm(x)
         qkv = self.w_qkv(h).reshape(B, T, 3, nh, dh)
         q, k, v = qkv.unbind(dim=2)               # (B, T, nh, dh)
@@ -319,8 +346,23 @@ class PlainBlock(nn.Module):
         )
         x = x + self.attn_drop(self.w_o(y.transpose(1, 2).reshape(B, T, D)))
 
+        # MLP
         h = self.mlp_norm(x)
-        x = x + self.mlp_drop(self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h)))
+        if self.use_feat_attn:
+            # Feature attention: reshape d_model as (nh, dh), attend over nh
+            gate = self.feat_gate(h)                       # (B, T, ffn_dim)
+            val = self.feat_up(h)                          # (B, T, ffn_dim)
+            ffn_dim = gate.shape[-1]
+            fdh = ffn_dim // nh
+            # Reshape to (B*T, 1, nh, fdh) for attention over features
+            gate = gate.view(B * T, 1, nh, fdh)
+            gate = self.feat_qk_norm(gate)
+            val = val.view(B * T, 1, nh, fdh)
+            feat_out = F.scaled_dot_product_attention(gate, gate, val, is_causal=False)
+            feat_out = feat_out.view(B, T, ffn_dim)
+            x = x + self.mlp_drop(self.feat_down(feat_out))
+        else:
+            x = x + self.mlp_drop(self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h)))
         return x
 
 
@@ -332,7 +374,8 @@ class PlainTransformerModel(nn.Module):
     Embedding weights are tied with the output head.
     """
 
-    def __init__(self, block_size, d_model, n_head, n_layer, vocab_size, dropout=0.1):
+    def __init__(self, block_size, d_model, n_head, n_layer, vocab_size, dropout=0.1,
+                 use_lerp=False, use_feat_attn=False):
         super().__init__()
         self.uci_mode = True
         self.block_size = block_size
@@ -345,7 +388,8 @@ class PlainTransformerModel(nn.Module):
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
         self.layers = nn.ModuleList([
-            PlainBlock(d_model, n_head, dropout) for _ in range(n_layer)
+            PlainBlock(d_model, n_head, dropout, use_lerp=use_lerp, use_feat_attn=use_feat_attn)
+            for _ in range(n_layer)
         ])
         self.ln_f = nn.RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -357,12 +401,14 @@ class PlainTransformerModel(nn.Module):
         # Embedding: std = 1/sqrt(d_model) so initial logits have std ≈ 1
         d_model = self.embed.embedding_dim
         nn.init.normal_(self.embed.weight, std=d_model ** -0.5)
-        # Residual output projections (w_o, down_proj): scale by 1/sqrt(2*n_layer)
+        # Residual output projections (w_o, down_proj/feat_down): scale by 1/sqrt(2*n_layer)
         # to keep residual stream from growing with depth
         residual_scale = (2 * n_layer) ** -0.5
         for layer in self.layers:
             nn.init.normal_(layer.w_o.weight, std=d_model ** -0.5 * residual_scale)
-            nn.init.normal_(layer.down_proj.weight, std=d_model ** -0.5 * residual_scale)
+            down = getattr(layer, 'down_proj', None) or getattr(layer, 'feat_down', None)
+            if down is not None:
+                nn.init.normal_(down.weight, std=d_model ** -0.5 * residual_scale)
 
     def forward(self, feature_ids):
         if isinstance(feature_ids, dict):
