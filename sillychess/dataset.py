@@ -273,20 +273,37 @@ class CachedChessDataset(Dataset):
     def _getitem_2d(self, idx):
         """Full-game bucketed item for composite (2D) mode.
 
-        Pads all feature columns (including uci_move if present) to the
-        bucket boundary.  Returns x=seq[:-1], y=seq[1:] for all columns.
+        Pre-stacks the 9 feature columns into a single (T, 9) tensor under
+        the key "features" for fast embedding lookup.  Also returns "step"
+        and "uci_move" as separate keys for loss masking/targets.
         """
         seq = self.sequences[self._kept_indices[idx]]
         padded_len = self.padded_lens[idx]
-        feat_x = {}
-        feat_y = {}
-        for name, values in seq.items():
-            arr = np.asarray(values, dtype=np.int64)
+
+        # Stack all 9 feature columns into (padded_len, 9)
+        feature_names = list(FEATURE_IDS.keys())
+        stacked = np.zeros((padded_len, len(feature_names)), dtype=np.int64)
+        for i, name in enumerate(feature_names):
+            arr = np.asarray(seq[name], dtype=np.int64)
+            stacked[:len(arr), i] = arr
+
+        t = torch.from_numpy(stacked)
+        feat_x = {"features": t[:-1]}                     # (T-1, 9)
+        feat_y = {"features": t[1:]}                       # (T-1, 9)
+
+        # step for padding mask (step is one of the 9 features)
+        step_idx = feature_names.index("step")
+        feat_y["step"] = feat_y["features"][:, step_idx]
+
+        # uci_move for loss target
+        if "uci_move" in seq:
+            arr = np.asarray(seq["uci_move"], dtype=np.int64)
             if len(arr) < padded_len:
                 arr = np.pad(arr, (0, padded_len - len(arr)))
-            t = torch.from_numpy(arr)
-            feat_x[name] = t[:-1]
-            feat_y[name] = t[1:]
+            t_uci = torch.from_numpy(arr)
+            feat_x["uci_move"] = t_uci[:-1]
+            feat_y["uci_move"] = t_uci[1:]
+
         return feat_x, feat_y
 
 

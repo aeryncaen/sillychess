@@ -11,7 +11,7 @@ from sillychess.dataset import (
 )
 from sillychess.eval import eval_legality, eval_loss, eval_loss_uci, eval_legality_uci
 from sillychess.model import TransformerModel
-from sillychess.san_features import FEATURE_SIZES
+from sillychess.san_features import FEATURE_SIZES, FEATURE_ORDER
 from sillychess.uci_vocab import UCI_VOCAB_SIZE, UCI_PLAIN_VOCAB_SIZE, PAD_ID
 
 
@@ -259,9 +259,12 @@ def main():
             else:
                 pad_mask = (feat_y["step"] != 0).float()
                 denom = pad_mask.sum().clamp_min(1.0)
+                # Extract per-feature targets from stacked (B, T, 9) tensor
+                feat_targets = feat_y["features"]
                 feature_losses = []
-                for name, logits in outputs.items():
-                    targets = feat_y[name]
+                for i, name in enumerate(FEATURE_ORDER):
+                    logits = outputs[name]
+                    targets = feat_targets[:, :, i]
                     raw = torch.nn.functional.cross_entropy(
                         logits.reshape(-1, logits.size(-1)),
                         targets.reshape(-1),

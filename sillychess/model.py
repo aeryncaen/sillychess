@@ -41,8 +41,11 @@ class CompositeSANEmbedding(nn.Module):
         self.embed = nn.Embedding(sum(sizes), rows_per_feature * w_dim)
 
     def forward(self, feature_ids):
-        ids = torch.stack([feature_ids[n] for n in self.feature_names], dim=-1)
-        ids = ids + self.offsets                               # (B, T, NF)
+        if isinstance(feature_ids, dict):
+            ids = feature_ids["features"]                      # (B, T, NF) pre-stacked
+        else:
+            ids = feature_ids
+        ids = ids + self.offsets                                # (B, T, NF)
         e = self.embed(ids)                                    # (B, T, NF, rpf*W)
         B, T = e.shape[:2]
         return e.view(B, T, -1)                                # (B, T, NF*rpf*W)

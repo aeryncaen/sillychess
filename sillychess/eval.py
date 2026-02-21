@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sillychess.dataset import BucketBatchSampler
-from sillychess.san_features import FEATURE_IDS, FEATURE_SPECS
+from sillychess.san_features import FEATURE_IDS, FEATURE_ORDER, FEATURE_SPECS
 from sillychess.uci_vocab import UCI_MOVES, PAD_ID, BOG_ID, MOVE_OFFSET
 
 
@@ -33,8 +33,10 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
             denom = pad_mask.sum().clamp_min(1.0)
 
             batch_loss = 0.0
-            for name, logits in outputs.items():
-                targets = feat_y[name]
+            feat_targets = feat_y["features"]
+            for i, name in enumerate(FEATURE_ORDER):
+                logits = outputs[name]
+                targets = feat_targets[:, :, i]
                 raw = torch.nn.functional.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     targets.reshape(-1),
@@ -96,11 +98,10 @@ def eval_legality(model, eval_sequences, device, max_games=50):
             if seq_len < 2:
                 continue
 
-            # Build full-game input (batch of 1)
-            feat_x = {}
-            for name in FEATURE_IDS:
-                arr = np.asarray(game_seq[name], dtype=np.int64)
-                feat_x[name] = torch.from_numpy(arr).unsqueeze(0).to(device)
+            # Build full-game input (batch of 1) — pre-stack features
+            feature_names = list(FEATURE_IDS.keys())
+            stacked = np.stack([np.asarray(game_seq[n], dtype=np.int64) for n in feature_names], axis=-1)
+            feat_x = {"features": torch.from_numpy(stacked).unsqueeze(0).to(device)}
 
             out = model(feat_x)  # dict of {name: (1, T, n_classes)}
 
@@ -239,13 +240,9 @@ def eval_legality_uci(model, eval_sequences, device, max_games=50):
                 tokens[1:] = np.asarray(moves, dtype=np.int64) + MOVE_OFFSET
                 feat_x = {"uci_move": torch.from_numpy(tokens).unsqueeze(0).to(device)}
             else:
-                feat_x = {}
-                all_names = list(FEATURE_IDS.keys())
-                if "uci_move" in game_seq:
-                    all_names.append("uci_move")
-                for name in all_names:
-                    arr = np.asarray(game_seq[name], dtype=np.int64)
-                    feat_x[name] = torch.from_numpy(arr).unsqueeze(0).to(device)
+                feature_names = list(FEATURE_IDS.keys())
+                stacked = np.stack([np.asarray(game_seq[n], dtype=np.int64) for n in feature_names], axis=-1)
+                feat_x = {"features": torch.from_numpy(stacked).unsqueeze(0).to(device)}
 
             logits = model(feat_x)  # (1, T, vocab_size)
 
