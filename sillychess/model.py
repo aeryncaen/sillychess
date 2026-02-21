@@ -235,28 +235,27 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CompositeOutputHead(nn.Module):
-    """Single softmax over composite vocab, weights tied to input embedding.
+    """Single softmax over composite vocab with its own descriptor table.
 
-    For each of the V vocab entries (a tuple of 8 feature IDs), the weight
-    vector is built by looking up each feature ID in the shared embedding
-    table (with per-feature offsets) and concatenating — the exact same
-    operation as CompositeSANEmbedding.
+    Owns an independent nn.Embedding(n_classes, rpf*w_dim) — same shape as
+    the input embedding table but separate parameters.  For each of the V
+    vocab entries (a tuple of 8 feature IDs), the weight vector is built by
+    looking up each feature ID and concatenating, same as CompositeSANEmbedding.
 
-    Computed fresh each forward pass: one gather of V*8 embeddings + reshape
-    + normalize.  No Python loops.
+    Computed fresh each forward pass: one gather + reshape + normalize.
     """
 
-    def __init__(self, vocab_tuples, embed_weight, offsets):
+    def __init__(self, vocab_tuples, n_classes, rpf_w_dim, offsets):
         super().__init__()
         # vocab_tuples: (V, 8) long tensor of feature IDs
-        # Pre-add offsets → absolute indices into the shared embedding table
+        # Pre-add offsets → absolute indices into our own embedding table
         abs_ids = vocab_tuples + offsets.unsqueeze(0)          # (V, 8)
         self.register_buffer('abs_ids', abs_ids)
-        self.embed_weight = embed_weight                       # reference to nn.Embedding.weight
+        self.embed = nn.Embedding(n_classes, rpf_w_dim)
 
     def _weight(self):
-        """Build (V, d_model) weight matrix from shared embedding table."""
-        w = self.embed_weight[self.abs_ids]                    # (V, 8, rpf*w_dim)
+        """Build (V, d_model) weight matrix from own descriptor table."""
+        w = self.embed.weight[self.abs_ids]                    # (V, 8, rpf*w_dim)
         w = w.reshape(w.shape[0], -1)                          # (V, d_model)
         return F.normalize(w, dim=-1)
 
@@ -391,8 +390,10 @@ class TransformerModel(nn.Module):
         else:
             if composite_vocab is None:
                 raise ValueError("composite_vocab required for non-UCI composite mode")
+            n_classes = sum(feature_sizes.values())
+            rpf_w_dim = rows_per_feature * w_dim
             self.output_head = CompositeOutputHead(
-                composite_vocab, self.embed.embed.weight, self.embed.offsets,
+                composite_vocab, n_classes, rpf_w_dim, self.embed.offsets,
             )
 
         self._init_weights(n_layer)
