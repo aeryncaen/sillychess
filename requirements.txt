@@ -1,4 +1,5 @@
 torch
 python-chess
+pyarrow
 zstandard
 tqdm

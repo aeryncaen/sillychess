@@ -18,8 +18,8 @@ data/
 # Model artifacts
 *.pt
 
-# Compiled Go binary
-preprocess
+# Compiled Go binary (root only, not cmd/preprocess/)
+/preprocess
 
 # OS
 .DS_Store

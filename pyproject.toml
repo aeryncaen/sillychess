@@ -9,6 +9,7 @@ requires-python = ">=3.10"
 dependencies = [
   "torch",
   "python-chess",
+  "pyarrow",
   "zstandard",
   "tqdm",
 ]
