@@ -135,15 +135,18 @@ class ChessBlock(nn.Module):
         x = x + feat_attn_mlp(norm2(x))                 # softmax feat attn replacing SwiGLU gate
     """
 
-    def __init__(self, n_features, desc_dim, dropout=0.1):
+    def __init__(self, n_features, desc_dim, dropout=0.1, use_lerp=False, use_feat_attn=False):
         super().__init__()
         NF = n_features
         DD = desc_dim
+        self.use_lerp = use_lerp
+        self.use_feat_attn = use_feat_attn
         # SwiGLU-style 8/3 expansion on descriptor dim, snapped to multiple of 8
         FFN_DD = ((DD * 8 // 3 + 7) // 8) * 8
 
         # --- Causal lerp: SSM-style temporal mixing on half of DD ---
-        self.causal_lerp = CausalLerp(DD)
+        if use_lerp:
+            self.causal_lerp = CausalLerp(DD)
 
         # --- Sequence attention (per-feature QKV on descriptor dim) ---
         init_scale = DD ** -0.5
@@ -163,16 +166,23 @@ class ChessBlock(nn.Module):
         self.post_attn_norm = nn.RMSNorm(DD)
         self.attn_drop = nn.Dropout(dropout)
 
-        # --- Feature-attention MLP (per-feature SwiGLU projections, softmax feat attn) ---
-        # gate_proj -> Q=K, up_proj -> V, softmax attn over NF, down_proj back
+        # --- MLP ---
         init_scale_ffn = FFN_DD ** -0.5
         self.feat_norm = nn.RMSNorm(DD)
-        self.feat_gate = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
-        self.feat_up = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
-        self.feat_down = nn.Parameter(torch.randn(NF, FFN_DD, DD) * init_scale_ffn)
-        # QK norm on feature attention gate (shared Q=K, so one norm)
-        self.feat_qk_norm = nn.RMSNorm(FFN_DD)
-        self.feat_qk_bias = nn.Parameter(torch.ones(FFN_DD))
+        if use_feat_attn:
+            # Feature-attention MLP: gate_proj -> Q=K, up_proj -> V,
+            # softmax attn over NF, down_proj back
+            self.feat_gate = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
+            self.feat_up = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
+            self.feat_down = nn.Parameter(torch.randn(NF, FFN_DD, DD) * init_scale_ffn)
+            # QK norm on feature attention gate (shared Q=K, so one norm)
+            self.feat_qk_norm = nn.RMSNorm(FFN_DD)
+            self.feat_qk_bias = nn.Parameter(torch.ones(FFN_DD))
+        else:
+            # Plain per-feature SwiGLU MLP (no cross-feature mixing)
+            self.mlp_gate = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
+            self.mlp_up = nn.Parameter(torch.randn(NF, DD, FFN_DD) * init_scale)
+            self.mlp_down = nn.Parameter(torch.randn(NF, FFN_DD, DD) * init_scale_ffn)
         # Post-MLP norm before residual add
         self.post_mlp_norm = nn.RMSNorm(DD)
         self.feat_drop = nn.Dropout(dropout)
@@ -189,7 +199,8 @@ class ChessBlock(nn.Module):
         b, t = x.shape[:2]
 
         # --- Causal lerp: temporal mixing on last half of DD ---
-        x = self.causal_lerp(x)
+        if self.use_lerp:
+            x = self.causal_lerp(x)
 
         # --- Sequence attention ---
         h = self.seq_norm(x)
@@ -215,21 +226,27 @@ class ChessBlock(nn.Module):
         y = proj_per_feature(y, self.w_o)
         x = x + self.attn_drop(self.post_attn_norm(y))
 
-        # --- Feature-attention MLP ---
+        # --- MLP ---
         h = self.feat_norm(x)
-        gate = proj_per_feature(h, self.feat_gate)            # (B, T, NF, FD) — Q=K
-        val = proj_per_feature(h, self.feat_up)               # (B, T, NF, FD) — V
+        if self.use_feat_attn:
+            # Feature-attention MLP
+            gate = proj_per_feature(h, self.feat_gate)            # (B, T, NF, FD) — Q=K
+            val = proj_per_feature(h, self.feat_up)               # (B, T, NF, FD) — V
 
-        # QK norm on gate (shared Q=K)
-        gate = self.feat_qk_norm(gate) * self.feat_qk_bias
+            # QK norm on gate (shared Q=K)
+            gate = self.feat_qk_norm(gate) * self.feat_qk_bias
 
-        # Softmax attention over NF features at expanded FD: (B*T, 1, NF, FD)
-        gate = gate.reshape(b * t, 1, NF, FD)
-        val = val.reshape(b * t, 1, NF, FD)
-        feat_out = F.scaled_dot_product_attention(gate, gate, val, is_causal=False)
-
-        feat_out = feat_out.view(b, t, NF, FD)
-        feat_out = proj_per_feature(feat_out, self.feat_down) # (B, T, NF, DD)
+            # Softmax attention over NF features at expanded FD: (B*T, 1, NF, FD)
+            gate = gate.reshape(b * t, 1, NF, FD)
+            val = val.reshape(b * t, 1, NF, FD)
+            feat_out = F.scaled_dot_product_attention(gate, gate, val, is_causal=False)
+            feat_out = feat_out.view(b, t, NF, FD)
+            feat_out = proj_per_feature(feat_out, self.feat_down) # (B, T, NF, DD)
+        else:
+            # Plain per-feature SwiGLU MLP
+            gate = proj_per_feature(h, self.mlp_gate)             # (B, T, NF, FD)
+            up = proj_per_feature(h, self.mlp_up)                 # (B, T, NF, FD)
+            feat_out = proj_per_feature(F.silu(gate) * up, self.mlp_down)  # (B, T, NF, DD)
         x = x + self.feat_drop(self.post_mlp_norm(feat_out))
 
         return x
@@ -446,6 +463,8 @@ class TwoStageTransformerModel(nn.Module):
         dropout=0.1,
         feature_sizes=None,
         uci_vocab_size=None,
+        use_lerp=False,
+        use_feat_attn=False,
         # Legacy compat (ignored)
         h_rows=None, n_head=None, n_intra_layer=None, n_inter_layer=None,
         feature_decoder_layers=None, ml_decoder_queries=None,
@@ -485,6 +504,8 @@ class TwoStageTransformerModel(nn.Module):
                 n_features=total_rows,
                 desc_dim=w_dim,
                 dropout=dropout,
+                use_lerp=use_lerp,
+                use_feat_attn=use_feat_attn,
             )
             for _ in range(n_layer)
         ])

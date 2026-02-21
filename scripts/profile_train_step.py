@@ -6,8 +6,9 @@ from typing import Dict
 
 import torch
 
-from sillychess.model import TwoStageTransformerModel
+from sillychess.model import PlainTransformerModel, TwoStageTransformerModel
 from sillychess.san_features import FEATURE_SIZES
+from sillychess.uci_vocab import UCI_VOCAB_SIZE, UCI_PLAIN_VOCAB_SIZE
 
 
 def count_parameters(model: torch.nn.Module) -> tuple[int, int]:
@@ -85,15 +86,23 @@ def train_step(
     grad_clip: float,
 ) -> torch.Tensor:
     out = model(x)
-    losses = []
-    for name, logits in out.items():
-        losses.append(
-            torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                y[name].reshape(-1),
+    if isinstance(out, dict):
+        losses = []
+        for name, logits in out.items():
+            losses.append(
+                torch.nn.functional.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    y[name].reshape(-1),
+                )
             )
+        loss = sum(losses) / len(losses)
+    else:
+        # UCI mode: single logits tensor
+        targets = y["uci_move"]
+        loss = torch.nn.functional.cross_entropy(
+            out.reshape(-1, out.size(-1)),
+            targets.reshape(-1),
         )
-    loss = sum(losses) / len(losses)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     if grad_clip > 0:
@@ -110,40 +119,83 @@ def main() -> None:
     parser.add_argument("--w-dim", type=int, default=48)
     parser.add_argument("--rows-per-feature", type=int, default=4)
     parser.add_argument("--n-layer", type=int, default=6)
+    parser.add_argument("--n-head", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-threads", type=int, default=1)
     parser.add_argument("--with-profiler", action="store_true")
     parser.add_argument("--profile-row-limit", type=int, default=25)
+    parser.add_argument("--uci-plain", action="store_true",
+                        help="profile PlainTransformerModel instead of 2D model")
+    parser.add_argument("--uci", action="store_true",
+                        help="2D model with UCI head")
+    parser.add_argument("--lerp", action="store_true",
+                        help="enable CausalLerp")
+    parser.add_argument("--feat-attn", action="store_true",
+                        help="enable feature attention MLP")
     args = parser.parse_args()
     device = resolve_device(args.device)
 
     torch.set_num_threads(args.num_threads)
 
-    model = TwoStageTransformerModel(
-        block_size=args.block_size,
-        w_dim=args.w_dim,
-        rows_per_feature=args.rows_per_feature,
-        n_layer=args.n_layer,
-        dropout=args.dropout,
-        feature_sizes=FEATURE_SIZES,
-    ).to(device)
+    if args.uci_plain:
+        vocab_size = UCI_PLAIN_VOCAB_SIZE
+        model = PlainTransformerModel(
+            block_size=args.block_size,
+            d_model=args.w_dim,
+            n_head=args.n_head,
+            n_layer=args.n_layer,
+            vocab_size=vocab_size,
+            dropout=args.dropout,
+            use_lerp=args.lerp,
+            use_feat_attn=args.feat_attn,
+        ).to(device)
+    else:
+        model = TwoStageTransformerModel(
+            block_size=args.block_size,
+            w_dim=args.w_dim,
+            rows_per_feature=args.rows_per_feature,
+            n_layer=args.n_layer,
+            dropout=args.dropout,
+            feature_sizes=FEATURE_SIZES,
+            uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
+            use_lerp=args.lerp,
+            use_feat_attn=args.feat_attn,
+        ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     model.train()
 
-    total_rows = len(FEATURE_SIZES) * args.rows_per_feature
     total_params, trainable_params = count_parameters(model)
     print("setup:")
-    print(
-        f"  device={device} batch_size={args.batch_size} block_size={args.block_size}"
-        f" w_dim={args.w_dim} rows_per_feature={args.rows_per_feature} total_rows={total_rows}"
-    )
-    print(f"  n_layer={args.n_layer}")
+    if args.uci_plain:
+        print(
+            f"  mode=uci_plain device={device} batch_size={args.batch_size}"
+            f" block_size={args.block_size} d_model={args.w_dim}"
+            f" n_head={args.n_head} n_layer={args.n_layer} vocab={vocab_size}"
+        )
+    else:
+        total_rows = len(FEATURE_SIZES) * args.rows_per_feature
+        print(
+            f"  mode=2D device={device} batch_size={args.batch_size}"
+            f" block_size={args.block_size} w_dim={args.w_dim}"
+            f" rows_per_feature={args.rows_per_feature} total_rows={total_rows}"
+            f" n_layer={args.n_layer}"
+        )
+    flags = []
+    if args.lerp:
+        flags.append("lerp")
+    if args.feat_attn:
+        flags.append("feat_attn")
+    if flags:
+        print(f"  flags: +{'+'.join(flags)}")
     print(f"  params_total={total_params:,} params_trainable={trainable_params:,}")
-    print(f"  tokens: [B, T, {total_rows}, {args.w_dim}]")
 
     x, y = make_batch(FEATURE_SIZES, args.batch_size, args.block_size, device)
+    if args.uci_plain:
+        # Override with UCI token batch
+        x = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.block_size), dtype=torch.long, device=device)}
+        y = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.block_size), dtype=torch.long, device=device)}
 
     gc.collect()
     if device.startswith("cuda") and torch.cuda.is_available():

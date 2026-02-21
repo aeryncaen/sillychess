@@ -12,7 +12,7 @@ from sillychess.dataset import (
     iter_jsonl_games,
     iter_pgn_games,
 )
-from sillychess.eval import eval_legality, eval_loss, eval_loss_uci, eval_legality_uci, split_eval
+from sillychess.eval import eval_legality, eval_loss, eval_loss_uci, eval_legality_uci
 from sillychess.model import PlainTransformerModel, TwoStageTransformerModel
 from sillychess.san_features import FEATURE_SIZES
 from sillychess.uci_vocab import UCI_VOCAB_SIZE, UCI_PLAIN_VOCAB_SIZE, PAD_ID
@@ -107,9 +107,9 @@ def main():
     parser.add_argument("--n-head", type=int, default=4,
                         help="attention heads for --uci-plain (d_model must be divisible)")
     parser.add_argument("--lerp", action="store_true",
-                        help="enable CausalLerp in --uci-plain blocks")
+                        help="enable CausalLerp (both 1D and 2D models)")
     parser.add_argument("--feat-attn", action="store_true",
-                        help="replace SwiGLU with feature attention in --uci-plain blocks")
+                        help="enable feature attention MLP (both 1D and 2D models)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--save-model", default="model.pt")
     args = parser.parse_args()
@@ -119,25 +119,22 @@ def main():
         args.uci = True
 
     print("init: resolving dataset...")
-    target_windows = args.steps * args.batch_size
     winner_only = args.perspective == "winner"
 
     if args.cache_dir:
         dataset = CachedChessDataset(
             args.cache_dir,
             block_size=args.block_size,
-            max_games=None,
-            target_windows=target_windows,
             uci_plain=args.uci_plain,
         )
         print(
-            f"init: dataset ready — "
-            f"shards={dataset.loaded_shards} games={dataset.loaded_games}"
+            f"init: shard 0/{dataset.total_shards} loaded — "
+            f"games={dataset.loaded_games}"
         )
         if dataset.uci_plain:
             print(f"init: buckets={dataset.buckets} dropped={dataset.dropped_games}")
 
-        # Split train/eval
+        # Split train/eval (eval carved from shard 0, static)
         if len(dataset.sequences) >= 10:
             train_dataset, eval_dataset = dataset.split_eval(eval_fraction=0.1)
             print(f"init: train={len(train_dataset)} eval={len(eval_dataset)}")
@@ -146,11 +143,13 @@ def main():
             eval_dataset = None
             print("init: too few games to split, no eval set")
 
-        if dataset.uci_plain:
-            sampler = BucketBatchSampler(train_dataset.bucket_ids, args.batch_size, shuffle=True)
-            loader = DataLoader(train_dataset, batch_sampler=sampler)
-        else:
-            loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        def make_loader(ds):
+            if args.uci_plain:
+                sampler = BucketBatchSampler(ds.bucket_ids, args.batch_size, shuffle=True)
+                return DataLoader(ds, batch_sampler=sampler)
+            return DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+
+        loader = make_loader(train_dataset)
     else:
         if not args.data:
             raise ValueError("--data is required when not using --cache-dir")
@@ -158,11 +157,12 @@ def main():
             args.data, args.format, args.perspective,
             winner_only=winner_only, max_games=None,
         )
-        dataset = ChessMoveDataset(games, args.block_size, target_windows=target_windows)
+        dataset = ChessMoveDataset(games, args.block_size)
         print("init: dataset ready")
         train_dataset = dataset
         eval_dataset = None
         loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        make_loader = None  # no shard rotation for non-cached
 
     if args.uci_plain:
         args.uci = True  # --uci-plain implies --uci
@@ -198,8 +198,16 @@ def main():
             dropout=args.dropout,
             feature_sizes=FEATURE_SIZES,
             uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
+            use_lerp=args.lerp,
+            use_feat_attn=args.feat_attn,
         ).to(device)
-        print(f"init: model ready (2D, uci_mode={model.uci_mode})")
+        flags = []
+        if args.lerp:
+            flags.append("lerp")
+        if args.feat_attn:
+            flags.append("feat_attn")
+        flag_str = f" +{'+'.join(flags)}" if flags else ""
+        print(f"init: model ready (2D, uci_mode={model.uci_mode}{flag_str})")
 
     total_params, trainable_params = count_parameters(model)
     if hasattr(dataset, "sequences") and dataset.sequences is not None:
@@ -292,6 +300,11 @@ def main():
             try:
                 feat_x, feat_y = next(data_iter)
             except StopIteration:
+                # Rotate to next shard if streaming
+                if make_loader is not None and hasattr(train_dataset, 'advance_shard'):
+                    new_idx = train_dataset.advance_shard()
+                    tqdm.write(f"  shard: loaded {new_idx}/{train_dataset.total_shards} ({train_dataset.loaded_games} games)")
+                    loader = make_loader(train_dataset)
                 data_iter = iter(loader)
                 feat_x, feat_y = next(data_iter)
 

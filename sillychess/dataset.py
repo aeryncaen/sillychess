@@ -148,128 +148,108 @@ class ChessMoveDataset(Dataset):
 
 
 class CachedChessDataset(Dataset):
-    def __init__(self, cache_dir, block_size=128, max_games=None, target_windows=None,
+    """Map-style dataset that streams one shard at a time.
+
+    Only one shard's worth of game data lives in memory.  Call
+    ``advance_shard()`` to discard the current shard and load the next.
+    """
+
+    def __init__(self, cache_dir, block_size=128,
                  uci_plain=False, n_buckets=8, drop_above_percentile=99):
         self.block_size = block_size
         self.uci_plain = uci_plain
-        self.sequences = []
-        self._target_windows = target_windows
-        self._loaded_windows = 0
-        self.loaded_shards = 0
-        self.loaded_games = 0
-        cache_path = Path(cache_dir)
-        pt_shards = sorted(cache_path.glob("shard-*.pt"))
-        parquet_shards = sorted(cache_path.glob("shard-*.parquet"))
+        self._n_buckets = n_buckets
+        self._drop_pct = drop_above_percentile
 
-        if pt_shards:
-            self._load_pt_shards(pt_shards, max_games=max_games)
-        elif parquet_shards:
-            self._load_parquet_shards(parquet_shards, max_games=max_games)
+        cache_path = Path(cache_dir)
+        parquet_shards = sorted(cache_path.glob("shard-*.parquet"))
+        pt_shards = sorted(cache_path.glob("shard-*.pt"))
+
+        if parquet_shards:
+            self._shard_paths = parquet_shards
+            self._shard_fmt = "parquet"
+        elif pt_shards:
+            self._shard_paths = pt_shards
+            self._shard_fmt = "pt"
         else:
             raise ValueError("no shard-*.pt or shard-*.parquet files found in cache dir")
 
-        if uci_plain:
-            # Full-game mode: bucket by length, no sliding windows
-            self._build_buckets(n_buckets, drop_above_percentile)
+        self.total_shards = len(self._shard_paths)
+        self._shard_idx = 0
+        self._load_current_shard()
+
+    # ------------------------------------------------------------------
+    # Single-shard loaders
+    # ------------------------------------------------------------------
+
+    def _load_current_shard(self):
+        """Load shard at ``_shard_idx`` and build the index/buckets."""
+        self.sequences = []
+        path = self._shard_paths[self._shard_idx]
+        if self._shard_fmt == "parquet":
+            self._load_one_parquet(path)
         else:
-            # Window mode: sliding windows over feature sequences
+            self._load_one_pt(path)
+        self.loaded_games = len(self.sequences)
+        self._rebuild_index()
+
+    def _load_one_parquet(self, path):
+        import pandas as pd
+        feature_names = list(FEATURE_IDS.keys())
+        df = pd.read_parquet(path)
+        has_uci = "uci_move" in df.columns
+        cols = feature_names + (["uci_move"] if has_uci else [])
+        col_arrays = {name: df[name].values for name in cols}
+        for idx in range(len(df)):
+            feature_seq = {}
+            for name in feature_names:
+                val = col_arrays[name][idx]
+                feature_seq[name] = np.asarray(val, dtype=np.int32) if val is not None else np.empty(0, dtype=np.int32)
+            if has_uci:
+                val = col_arrays["uci_move"][idx]
+                feature_seq["uci_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
+            self.sequences.append(feature_seq)
+
+    def _load_one_pt(self, path):
+        payload = torch.load(path, map_location="cpu")
+        features = payload["features"]
+        n = len(next(iter(features.values())))
+        for idx in range(n):
+            self.sequences.append({name: features[name][idx] for name in FEATURE_IDS})
+
+    def _rebuild_index(self):
+        """Build window index (windowed mode) or bucket metadata (uci_plain)."""
+        if self.uci_plain:
+            self._build_buckets(self._n_buckets, self._drop_pct)
+        else:
             self.index = []
-            for g_idx, feature_seq in enumerate(
-                tqdm(self.sequences, desc="build windows", unit="game")
-            ):
-                length = len(feature_seq[next(iter(FEATURE_IDS))])
-                max_start = max(0, length - block_size - 1)
+            for g_idx, seq in enumerate(self.sequences):
+                length = len(seq[next(iter(FEATURE_IDS))])
+                max_start = max(0, length - self.block_size - 1)
                 for start in range(max_start + 1):
                     self.index.append((g_idx, start))
 
-    def _record_windows(self, length):
-        self._loaded_windows += _windows_for_length(length, self.block_size)
-        if self._target_windows is None:
-            return False
-        return self._loaded_windows >= self._target_windows
+    # ------------------------------------------------------------------
+    # Shard rotation
+    # ------------------------------------------------------------------
 
-    def _load_pt_shards(self, shard_paths, max_games=None):
-        count = 0
-        pbar = tqdm(desc="load .pt shards", unit="shard")
-        try:
-            for shard_path in shard_paths:
-                payload = torch.load(shard_path, map_location="cpu")
-                features = payload["features"]
-                length = len(next(iter(features.values())))
-                self.loaded_shards += 1
-                for idx in range(length):
-                    feature_seq = {name: features[name][idx] for name in FEATURE_IDS}
-                    self.sequences.append(feature_seq)
-                    count += 1
-                    self.loaded_games += 1
-                    seq_len = len(feature_seq[next(iter(FEATURE_IDS))])
-                    if self._record_windows(seq_len):
-                        pbar.update(1)
-                        pbar.set_postfix(
-                            games=self.loaded_games,
-                            windows=self._loaded_windows,
-                            target=self._target_windows,
-                            stop="target",
-                        )
-                        return
-                    if max_games is not None and count >= max_games:
-                        pbar.update(1)
-                        pbar.set_postfix(
-                            games=self.loaded_games,
-                            windows=self._loaded_windows,
-                            target=self._target_windows,
-                            stop="max_games",
-                        )
-                        return
-                pbar.update(1)
-                pbar.set_postfix(
-                    games=self.loaded_games,
-                    windows=self._loaded_windows,
-                    target=self._target_windows,
-                )
-        finally:
-            pbar.close()
+    def advance_shard(self):
+        """Discard current shard, load next (cycling).  Returns new shard index."""
+        self._shard_idx = (self._shard_idx + 1) % len(self._shard_paths)
+        self._load_current_shard()
+        return self._shard_idx
 
-    def _load_parquet_shards(self, shard_paths, max_games=None):
-        import pandas as pd
-
-        feature_names = list(FEATURE_IDS.keys())
-        pbar = tqdm(desc="load .parquet shards", unit="shard")
-        try:
-            for shard_path in shard_paths:
-                df = pd.read_parquet(shard_path)
-                has_uci = "uci_move" in df.columns
-                cols = feature_names + (["uci_move"] if has_uci else [])
-                # .values gives object array of numpy arrays — no Python int conversion
-                col_arrays = {name: df[name].values for name in cols}
-                n_rows = len(df)
-                self.loaded_shards += 1
-                for idx in range(n_rows):
-                    feature_seq = {}
-                    for name in feature_names:
-                        val = col_arrays[name][idx]
-                        feature_seq[name] = np.asarray(val, dtype=np.int32) if val is not None else np.empty(0, dtype=np.int32)
-                    if has_uci:
-                        val = col_arrays["uci_move"][idx]
-                        feature_seq["uci_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
-                    self.sequences.append(feature_seq)
-                    self.loaded_games += 1
-                    seq_len = len(feature_seq[feature_names[0]])
-                    if self._record_windows(seq_len):
-                        pbar.update(1)
-                        pbar.set_postfix(games=self.loaded_games, windows=self._loaded_windows, target=self._target_windows, stop="target")
-                        return
-                    if max_games is not None and self.loaded_games >= max_games:
-                        pbar.update(1)
-                        pbar.set_postfix(games=self.loaded_games, windows=self._loaded_windows, target=self._target_windows, stop="max_games")
-                        return
-                pbar.update(1)
-                pbar.set_postfix(games=self.loaded_games, windows=self._loaded_windows, target=self._target_windows)
-        finally:
-            pbar.close()
+    # ------------------------------------------------------------------
+    # Bucketing (uci_plain)
+    # ------------------------------------------------------------------
 
     def _build_buckets(self, n_buckets, drop_above_percentile):
         """Compute bucket boundaries and per-game metadata for full-game mode."""
+        if not self.sequences or "uci_move" not in self.sequences[0]:
+            raise ValueError(
+                "uci_plain mode requires shards with 'uci_move' column — "
+                "re-run the Go preprocessor with -vocab uci_vocab.txt"
+            )
         tok_lens = np.array([len(s["uci_move"]) + 2 for s in self.sequences])
         max_len = int(np.percentile(tok_lens, drop_above_percentile))
         kept_mask = tok_lens <= max_len
@@ -296,8 +276,19 @@ class CachedChessDataset(Dataset):
             self.bucket_ids.append(bid)
             self.padded_lens.append(self.buckets[bid])
 
+    # ------------------------------------------------------------------
+    # Train / eval split
+    # ------------------------------------------------------------------
+
     def split_eval(self, eval_fraction=0.1):
-        """Split into train/eval. Returns (train_ds, eval_ds)."""
+        """Carve eval data from the current (first) shard.
+
+        Returns ``(self, eval_ds)``.  ``self`` retains shard paths and can
+        rotate via ``advance_shard()``.  ``eval_ds`` is a static snapshot
+        that never rotates.
+        """
+        import copy
+
         if self.uci_plain:
             n = len(self._kept_indices)
         else:
@@ -305,31 +296,29 @@ class CachedChessDataset(Dataset):
         n_eval = max(1, int(n * eval_fraction))
         n_train = n - n_eval
 
-        # Shallow-copy and slice
-        import copy
-        train_ds = copy.copy(self)
         eval_ds = copy.copy(self)
+        eval_ds._shard_paths = []  # prevent rotation
 
         if self.uci_plain:
-            train_ds._kept_indices = self._kept_indices[:n_train]
-            train_ds.bucket_ids = self.bucket_ids[:n_train]
-            train_ds.padded_lens = self.padded_lens[:n_train]
-            train_ds.loaded_games = n_train
             eval_ds._kept_indices = self._kept_indices[n_train:]
             eval_ds.bucket_ids = self.bucket_ids[n_train:]
             eval_ds.padded_lens = self.padded_lens[n_train:]
             eval_ds.loaded_games = n_eval
+            # trim self (train)
+            self._kept_indices = self._kept_indices[:n_train]
+            self.bucket_ids = self.bucket_ids[:n_train]
+            self.padded_lens = self.padded_lens[:n_train]
+            self.loaded_games = n_train
         else:
-            eval_seqs = self.sequences[n_train:]
-            train_ds.sequences = self.sequences[:n_train]
-            train_ds.loaded_games = n_train
-            eval_ds.sequences = eval_seqs
+            eval_ds.sequences = self.sequences[n_train:]
             eval_ds.loaded_games = n_eval
-            # Rebuild window indices
-            train_ds.index = [(g, s) for g, s in self.index if g < n_train]
             eval_ds.index = [(g - n_train, s) for g, s in self.index if g >= n_train]
+            # trim self (train)
+            self.sequences = self.sequences[:n_train]
+            self.loaded_games = n_train
+            self.index = [(g, s) for g, s in self.index if g < n_train]
 
-        return train_ds, eval_ds
+        return self, eval_ds
 
     def __len__(self):
         if self.uci_plain:

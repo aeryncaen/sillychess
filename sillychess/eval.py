@@ -1,6 +1,7 @@
 """Eval utilities: dataset splitting and move legality checking."""
 
 import chess
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -156,10 +157,10 @@ def eval_legality(model, eval_sequences, block_size, device, max_games=50,
                     vals = w[name]
                     pad_len = max_len - len(vals)
                     if pad_len > 0:
-                        padded.append(vals + [0] * pad_len)
+                        padded.append(np.pad(np.asarray(vals), (0, pad_len)))
                     else:
-                        padded.append(vals)
-                feat_x[name] = torch.tensor(padded, dtype=torch.long, device=device)
+                        padded.append(np.asarray(vals))
+                feat_x[name] = torch.from_numpy(np.stack(padded).astype(np.int64)).to(device)
 
             out = model(feat_x)
             # Gather last real position for each window
@@ -349,10 +350,10 @@ def eval_legality_uci(model, eval_sequences, block_size, device, max_games=50,
                     vals = w[name]
                     pad_len = max_len - len(vals)
                     if pad_len > 0:
-                        padded.append(vals + [0] * pad_len)
+                        padded.append(np.pad(vals, (0, pad_len)))
                     else:
-                        padded.append(vals)
-                feat_x[name] = torch.tensor(padded, dtype=torch.long, device=device)
+                        padded.append(np.asarray(vals))
+                feat_x[name] = torch.from_numpy(np.stack(padded).astype(np.int64)).to(device)
 
             logits = model(feat_x)  # (B, T, vocab_size)
             lengths = [len(w["piece"]) for w in batch_windows]
