@@ -12,6 +12,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -253,12 +254,68 @@ class CompositeOutputHead(nn.Module):
         self.register_buffer('abs_ids', abs_ids)
         self.embed_weight = embed_weight                       # reference to nn.Embedding.weight
 
-    def forward(self, x):
-        """x: (B, T, d_model) -> (B, T, V)"""
+    def _weight(self):
+        """Build (V, d_model) weight matrix from shared embedding table."""
         w = self.embed_weight[self.abs_ids]                    # (V, 8, rpf*w_dim)
         w = w.reshape(w.shape[0], -1)                          # (V, d_model)
-        w = F.normalize(w, dim=-1)
-        return F.linear(x, w)                                  # (B, T, V)
+        return F.normalize(w, dim=-1)
+
+    def forward(self, x):
+        """x: (B, T, d_model) -> (B, T, V)"""
+        return F.linear(x, self._weight())                     # (B, T, V)
+
+    def chunked_loss(self, x, targets, mask, chunk_tokens=4096):
+        """Chunked cross-entropy loss — never materializes full (B*T, V) logits.
+
+        Args:
+            x: (B, T, d_model) hidden states from encoder.
+            targets: (B, T) composite vocab IDs (may contain -1 for invalid).
+            mask: (B, T) bool — True for valid positions.
+            chunk_tokens: number of tokens per chunk.
+
+        Returns:
+            (loss, n_correct, n_valid) — scalar loss, int counts.
+        """
+        w = self._weight()                                     # (V, d_model)
+        B, T, D = x.shape
+        x_flat = x.reshape(B * T, D)
+        tgt_flat = targets.reshape(B * T).clamp(min=0)
+        mask_flat = mask.reshape(B * T)
+
+        total_loss = x.new_zeros(())
+        total_correct = 0
+        n_valid = int(mask_flat.sum().item())
+
+        for start in range(0, B * T, chunk_tokens):
+            end = min(start + chunk_tokens, B * T)
+            x_c = x_flat[start:end]
+            t_c = tgt_flat[start:end]
+            m_c = mask_flat[start:end]
+            if not m_c.any():
+                continue
+
+            if torch.is_grad_enabled():
+                chunk_loss, chunk_correct = grad_checkpoint(
+                    self._chunk_ce, x_c, w, t_c, m_c, use_reentrant=False,
+                )
+            else:
+                chunk_loss, chunk_correct = self._chunk_ce(x_c, w, t_c, m_c)
+            total_loss = total_loss + chunk_loss
+            total_correct += int(chunk_correct.item())
+
+        loss = total_loss / max(n_valid, 1)
+        return loss, total_correct, n_valid
+
+    @staticmethod
+    def _chunk_ce(x_c, w, t_c, m_c):
+        """Compute CE loss for one chunk. Checkpointed during training."""
+        logits = F.linear(x_c, w)                              # (chunk, V)
+        raw = F.cross_entropy(logits, t_c, reduction="none")   # (chunk,)
+        loss = (raw * m_c.float()).sum()
+        with torch.no_grad():
+            preds = logits.argmax(dim=-1)
+            correct = ((preds == t_c) & m_c).sum()
+        return loss, correct
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +407,15 @@ class TransformerModel(nn.Module):
             if down is not None:
                 nn.init.normal_(down.weight, std=self.d_model ** -0.5 * residual_scale)
 
-    def forward(self, feature_ids):
+    def encode(self, feature_ids):
+        """Run backbone (embed → drop → RoPE → layers → ln_f), return hidden states.
+
+        Args:
+            feature_ids: dict with "features" (B, T, 8) or "uci_move" (B, T).
+
+        Returns:
+            (B, T, d_model) hidden states.
+        """
         if self.embed_mode == "composite":
             x = self.embed(feature_ids)                    # (B, T, d_model)
         else:
@@ -371,7 +436,10 @@ class TransformerModel(nn.Module):
         for layer in self.layers:
             x = layer(x, rope_cos, rope_sin)
 
-        x = self.ln_f(x)
+        return self.ln_f(x)
+
+    def forward(self, feature_ids):
+        x = self.encode(feature_ids)
 
         if self.embed_mode == "composite" and not self.uci_mode:
             return self.output_head(x)                     # (B, T, composite_vocab_size)

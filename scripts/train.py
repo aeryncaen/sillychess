@@ -237,10 +237,10 @@ def main():
             feat_x = {name: tensor.to(device) for name, tensor in feat_x.items()}
             feat_y = {name: tensor.to(device) for name, tensor in feat_y.items()}
 
-            outputs = model(feat_x)
             train_acc = None
 
             if args.uci_plain:
+                outputs = model(feat_x)
                 targets = feat_y["uci_move"]
                 loss = torch.nn.functional.cross_entropy(
                     outputs.reshape(-1, outputs.size(-1)),
@@ -251,6 +251,7 @@ def main():
                 preds = outputs.argmax(dim=-1)
                 train_acc = ((preds == targets) & mask).sum().item() / mask.sum().clamp_min(1).item()
             elif args.uci:
+                outputs = model(feat_x)
                 pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
                 uci_targets = feat_y["uci_move"]
                 valid = (uci_targets >= 0) & (pad_mask > 0)
@@ -265,19 +266,14 @@ def main():
                 preds = outputs.argmax(dim=-1)
                 train_acc = ((preds == uci_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
             else:
-                pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
+                pad_mask = feat_y["features"][:, :, 0] != 0   # piece != 0
                 comp_targets = feat_y["composite_move"]
-                valid = (comp_targets >= 0) & (pad_mask > 0)
-                comp_targets_safe = comp_targets.clamp(min=0)
-                raw = torch.nn.functional.cross_entropy(
-                    outputs.reshape(-1, outputs.size(-1)),
-                    comp_targets_safe.reshape(-1),
-                    reduction="none",
+                valid = (comp_targets >= 0) & pad_mask
+                hidden = model.encode(feat_x)
+                loss, n_correct, n_valid = model.output_head.chunked_loss(
+                    hidden, comp_targets, valid,
                 )
-                raw = raw.view(pad_mask.shape)
-                loss = (raw * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
-                preds = outputs.argmax(dim=-1)
-                train_acc = ((preds == comp_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
+                train_acc = n_correct / max(n_valid, 1)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None

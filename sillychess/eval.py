@@ -12,7 +12,10 @@ from sillychess.uci_vocab import UCI_MOVES, PAD_ID, BOG_ID, MOVE_OFFSET
 
 
 def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
-    """Compute average cross-entropy loss on eval set for composite vocab model."""
+    """Compute average cross-entropy loss on eval set for composite vocab model.
+
+    Uses chunked_loss to avoid materializing the full (B*T, V) logits tensor.
+    """
     sampler = BucketBatchSampler(eval_dataset.bucket_ids, batch_size, shuffle=False)
     loader = DataLoader(eval_dataset, batch_sampler=sampler)
     model.eval()
@@ -27,28 +30,18 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
             feat_x = {name: t.to(device) for name, t in feat_x.items()}
             feat_y = {name: t.to(device) for name, t in feat_y.items()}
 
-            logits = model(feat_x)                         # (B, T, V)
             pad_mask = feat_y["features"][:, :, 0] != 0    # piece != 0
             comp_targets = feat_y["composite_move"]
             valid = (comp_targets >= 0) & pad_mask
-            comp_targets_safe = comp_targets.clamp(min=0)
 
-            raw = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                comp_targets_safe.reshape(-1),
-                reduction="none",
+            hidden = model.encode(feat_x)
+            batch_loss, n_correct, n_valid = model.output_head.chunked_loss(
+                hidden, comp_targets, valid,
             )
-            raw = raw.view(valid.shape)
-            n_valid = valid.float().sum().clamp_min(1.0)
-            batch_loss = (raw * valid.float()).sum() / n_valid
 
-            preds = logits.argmax(dim=-1)
-            n_correct = ((preds == comp_targets_safe) & valid).sum().item()
-            n_tokens = n_valid.item()
-
-            total_loss += batch_loss.item() * n_tokens
+            total_loss += batch_loss.item() * n_valid
             total_correct += n_correct
-            total_tokens += n_tokens
+            total_tokens += n_valid
 
     model.train()
     if total_tokens == 0:
