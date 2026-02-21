@@ -20,7 +20,6 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
     model.eval()
     total_loss = 0.0
     total_correct = 0
-    total_predictions = 0
     total_tokens = 0
 
     with torch.no_grad():
@@ -36,6 +35,7 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
 
             feat_targets = feat_y["features"]
             feature_losses = []
+            all_correct = (pad_mask > 0)
             for fi, name in enumerate(FEATURE_ORDER):
                 logits = outputs[name]
                 targets = feat_targets[:, :, fi]
@@ -46,21 +46,20 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
                 )
                 raw = raw.view(pad_mask.shape)
                 feature_losses.append((raw * pad_mask).sum() / denom)
-                preds = logits.argmax(dim=-1)
-                total_correct += ((preds == targets) & (pad_mask > 0)).sum().item()
-                total_predictions += denom.item()
+                all_correct = all_correct & (logits.argmax(dim=-1) == targets)
 
             # Contraharmonic mean (matches train.py)
             stacked = torch.stack(feature_losses)
             batch_loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
             n_tokens = denom.item()
             total_loss += batch_loss.item() * n_tokens
+            total_correct += all_correct.sum().item()
             total_tokens += n_tokens
 
     model.train()
     if total_tokens == 0:
         return float("nan"), 0.0
-    return total_loss / total_tokens, total_correct / max(1, total_predictions)
+    return total_loss / total_tokens, total_correct / max(1, total_tokens)
 
 
 # Reverse lookups for legality checking

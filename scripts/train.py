@@ -268,8 +268,7 @@ def main():
                 # Extract per-feature targets from stacked (B, T, 9) tensor
                 feat_targets = feat_y["features"]
                 feature_losses = []
-                n_correct = 0
-                n_predictions = 0
+                all_correct = (pad_mask > 0)  # start True for non-pad positions
                 for i, name in enumerate(FEATURE_ORDER):
                     logits = outputs[name]
                     targets = feat_targets[:, :, i]
@@ -280,14 +279,12 @@ def main():
                     )
                     raw = raw.view(pad_mask.shape)
                     feature_losses.append((raw * pad_mask).sum() / denom)
-                    preds = logits.argmax(dim=-1)
-                    n_correct += ((preds == targets) & (pad_mask > 0)).sum().item()
-                    n_predictions += denom.item()
+                    all_correct = all_correct & (logits.argmax(dim=-1) == targets)
                 # Contraharmonic mean: sum(L_i^2) / sum(L_i)
                 # Upweights harder features, prevents fast learners from dominating
                 stacked = torch.stack(feature_losses)
                 loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
-                train_acc = n_correct / max(1, n_predictions)
+                train_acc = all_correct.sum().item() / denom.item()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None
