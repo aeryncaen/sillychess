@@ -15,14 +15,6 @@ from sillychess.uci_vocab import PAD_ID, BOG_ID, EOG_ID, MOVE_OFFSET
 from pathlib import Path
 
 
-def _windows_for_length(length: int, block_size: int) -> int:
-    # Matches indexing logic below:
-    # windows = max(0, length - block_size - 1) + 1
-    if length > block_size:
-        return length - block_size
-    return 1
-
-
 @dataclass
 class GameMoves:
     features: List[Dict[str, str]]
@@ -96,67 +88,16 @@ def iter_jsonl_games(jsonl_path, max_games=None, self_color="white", winner_only
                 break
 
 
-class ChessMoveDataset(Dataset):
-    def __init__(self, games, block_size, target_windows=None):
-        self.block_size = block_size
-        self.sequences = []
-        loaded_windows = 0
-        for game in tqdm(games, desc="vectorize games", unit="game"):
-            feature_seq = {name: [] for name in FEATURE_IDS}
-            for feat in game.features:
-                for name, value in feat.items():
-                    feature_seq[name].append(FEATURE_IDS[name].get(value, 0))
-            self.sequences.append(feature_seq)
-            length = len(feature_seq[next(iter(FEATURE_IDS))])
-            loaded_windows += _windows_for_length(length, block_size)
-            if target_windows is not None and loaded_windows >= target_windows:
-                break
-
-        self.index = []
-        for g_idx, feature_seq in enumerate(
-            tqdm(self.sequences, desc="build windows", unit="game")
-        ):
-            length = len(feature_seq[next(iter(FEATURE_IDS))])
-            max_start = max(0, length - block_size - 1)
-            for start in range(max_start + 1):
-                self.index.append((g_idx, start))
-
-    def __len__(self):
-        return len(self.index)
-
-    def __getitem__(self, idx):
-        g_idx, start = self.index[idx]
-        feature_seq = self.sequences[g_idx]
-        feature_chunk = {
-            name: values[start : start + self.block_size + 1]
-            for name, values in feature_seq.items()
-        }
-        current_len = len(next(iter(feature_chunk.values())))
-        if current_len < self.block_size + 1:
-            pad_len = self.block_size + 1 - current_len
-            for name in feature_chunk:
-                feature_chunk[name] = feature_chunk[name] + [0] * pad_len
-        feat_x = {
-            name: torch.tensor(values[:-1], dtype=torch.long)
-            for name, values in feature_chunk.items()
-        }
-        feat_y = {
-            name: torch.tensor(values[1:], dtype=torch.long)
-            for name, values in feature_chunk.items()
-        }
-        return feat_x, feat_y
-
-
 class CachedChessDataset(Dataset):
     """Map-style dataset that streams one shard at a time.
 
     Only one shard's worth of game data lives in memory.  Call
     ``advance_shard()`` to discard the current shard and load the next.
+
+    Both uci_plain and 2D (composite) modes use full-game bucketed sequences.
     """
 
-    def __init__(self, cache_dir, block_size=128,
-                 uci_plain=False, n_buckets=8, drop_above_percentile=99):
-        self.block_size = block_size
+    def __init__(self, cache_dir, uci_plain=False, n_buckets=8, drop_above_percentile=99):
         self.uci_plain = uci_plain
         self._n_buckets = n_buckets
         self._drop_pct = drop_above_percentile
@@ -183,7 +124,7 @@ class CachedChessDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _load_current_shard(self):
-        """Load shard at ``_shard_idx`` and build the index/buckets."""
+        """Load shard at ``_shard_idx`` and build bucket metadata."""
         self.sequences = []
         path = self._shard_paths[self._shard_idx]
         if self._shard_fmt == "parquet":
@@ -191,7 +132,7 @@ class CachedChessDataset(Dataset):
         else:
             self._load_one_pt(path)
         self.loaded_games = len(self.sequences)
-        self._rebuild_index()
+        self._build_buckets(self._n_buckets, self._drop_pct)
 
     def _load_one_parquet(self, path):
         import pandas as pd
@@ -217,18 +158,6 @@ class CachedChessDataset(Dataset):
         for idx in range(n):
             self.sequences.append({name: features[name][idx] for name in FEATURE_IDS})
 
-    def _rebuild_index(self):
-        """Build window index (windowed mode) or bucket metadata (uci_plain)."""
-        if self.uci_plain:
-            self._build_buckets(self._n_buckets, self._drop_pct)
-        else:
-            self.index = []
-            for g_idx, seq in enumerate(self.sequences):
-                length = len(seq[next(iter(FEATURE_IDS))])
-                max_start = max(0, length - self.block_size - 1)
-                for start in range(max_start + 1):
-                    self.index.append((g_idx, start))
-
     # ------------------------------------------------------------------
     # Shard rotation
     # ------------------------------------------------------------------
@@ -240,17 +169,26 @@ class CachedChessDataset(Dataset):
         return self._shard_idx
 
     # ------------------------------------------------------------------
-    # Bucketing (uci_plain)
+    # Bucketing (both modes)
     # ------------------------------------------------------------------
 
     def _build_buckets(self, n_buckets, drop_above_percentile):
-        """Compute bucket boundaries and per-game metadata for full-game mode."""
-        if not self.sequences or "uci_move" not in self.sequences[0]:
-            raise ValueError(
-                "uci_plain mode requires shards with 'uci_move' column — "
-                "re-run the Go preprocessor with -vocab uci_vocab.txt"
-            )
-        tok_lens = np.array([len(s["uci_move"]) + 2 for s in self.sequences])
+        """Compute bucket boundaries and per-game metadata.
+
+        uci_plain: token length = len(uci_move) + 2  (BOG + moves + EOG)
+        composite: token length = len(game)  (raw feature length)
+        """
+        first_feat = next(iter(FEATURE_IDS))
+        if self.uci_plain:
+            if not self.sequences or "uci_move" not in self.sequences[0]:
+                raise ValueError(
+                    "uci_plain mode requires shards with 'uci_move' column -- "
+                    "re-run the Go preprocessor with -vocab uci_vocab.txt"
+                )
+            tok_lens = np.array([len(s["uci_move"]) + 2 for s in self.sequences])
+        else:
+            tok_lens = np.array([len(s[first_feat]) for s in self.sequences])
+
         max_len = int(np.percentile(tok_lens, drop_above_percentile))
         kept_mask = tok_lens <= max_len
         kept_lens = tok_lens[kept_mask]
@@ -289,46 +227,32 @@ class CachedChessDataset(Dataset):
         """
         import copy
 
-        if self.uci_plain:
-            n = len(self._kept_indices)
-        else:
-            n = len(self.sequences)
+        n = len(self._kept_indices)
         n_eval = max(1, int(n * eval_fraction))
         n_train = n - n_eval
 
         eval_ds = copy.copy(self)
         eval_ds._shard_paths = []  # prevent rotation
 
-        if self.uci_plain:
-            eval_ds._kept_indices = self._kept_indices[n_train:]
-            eval_ds.bucket_ids = self.bucket_ids[n_train:]
-            eval_ds.padded_lens = self.padded_lens[n_train:]
-            eval_ds.loaded_games = n_eval
-            # trim self (train)
-            self._kept_indices = self._kept_indices[:n_train]
-            self.bucket_ids = self.bucket_ids[:n_train]
-            self.padded_lens = self.padded_lens[:n_train]
-            self.loaded_games = n_train
-        else:
-            eval_ds.sequences = self.sequences[n_train:]
-            eval_ds.loaded_games = n_eval
-            eval_ds.index = [(g - n_train, s) for g, s in self.index if g >= n_train]
-            # trim self (train)
-            self.sequences = self.sequences[:n_train]
-            self.loaded_games = n_train
-            self.index = [(g, s) for g, s in self.index if g < n_train]
+        eval_ds._kept_indices = self._kept_indices[n_train:]
+        eval_ds.bucket_ids = self.bucket_ids[n_train:]
+        eval_ds.padded_lens = self.padded_lens[n_train:]
+        eval_ds.loaded_games = n_eval
+
+        self._kept_indices = self._kept_indices[:n_train]
+        self.bucket_ids = self.bucket_ids[:n_train]
+        self.padded_lens = self.padded_lens[:n_train]
+        self.loaded_games = n_train
 
         return self, eval_ds
 
     def __len__(self):
-        if self.uci_plain:
-            return len(self._kept_indices)
-        return len(self.index)
+        return len(self._kept_indices)
 
     def __getitem__(self, idx):
         if self.uci_plain:
             return self._getitem_uci_plain(idx)
-        return self._getitem_windowed(idx)
+        return self._getitem_2d(idx)
 
     def _getitem_uci_plain(self, idx):
         seq = self.sequences[self._kept_indices[idx]]
@@ -346,18 +270,21 @@ class CachedChessDataset(Dataset):
         t = torch.from_numpy(tokens)
         return {"uci_move": t[:-1]}, {"uci_move": t[1:]}
 
-    def _getitem_windowed(self, idx):
-        g_idx, start = self.index[idx]
-        feature_seq = self.sequences[g_idx]
-        end = start + self.block_size + 1
+    def _getitem_2d(self, idx):
+        """Full-game bucketed item for composite (2D) mode.
+
+        Pads all feature columns (including uci_move if present) to the
+        bucket boundary.  Returns x=seq[:-1], y=seq[1:] for all columns.
+        """
+        seq = self.sequences[self._kept_indices[idx]]
+        padded_len = self.padded_lens[idx]
         feat_x = {}
         feat_y = {}
-        for name, values in feature_seq.items():
-            chunk = values[start:end]
-            pad_needed = self.block_size + 1 - len(chunk)
-            if pad_needed > 0:
-                chunk = np.pad(chunk, (0, pad_needed))
-            t = torch.from_numpy(chunk.astype(np.int64))
+        for name, values in seq.items():
+            arr = np.asarray(values, dtype=np.int64)
+            if len(arr) < padded_len:
+                arr = np.pad(arr, (0, padded_len - len(arr)))
+            t = torch.from_numpy(arr)
             feat_x[name] = t[:-1]
             feat_y[name] = t[1:]
         return feat_x, feat_y
@@ -376,17 +303,10 @@ class BucketBatchSampler(Sampler):
     """
 
     def __init__(self, bucket_ids, batch_size, shuffle=True):
-        """
-        Args:
-            bucket_ids: list[int] — bucket index per dataset sample.
-            batch_size: int.
-            shuffle: bool — shuffle within buckets each epoch.
-        """
         super().__init__()
         self.batch_size = batch_size
         self.shuffle = shuffle
 
-        # Group sample indices by bucket
         from collections import defaultdict
         buckets = defaultdict(list)
         for idx, bid in enumerate(bucket_ids):
@@ -403,7 +323,6 @@ class BucketBatchSampler(Sampler):
             for start in range(0, len(perm) - self.batch_size + 1, self.batch_size):
                 all_batches.append(perm[start:start + self.batch_size])
 
-        # Shuffle batch order so training alternates between buckets
         if self.shuffle:
             order = torch.randperm(len(all_batches)).tolist()
             all_batches = [all_batches[i] for i in order]
@@ -415,6 +334,3 @@ class BucketBatchSampler(Sampler):
         for indices in self._buckets.values():
             total += len(indices) // self.batch_size
         return total
-
-
-

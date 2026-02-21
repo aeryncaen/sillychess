@@ -6,7 +6,7 @@ from typing import Dict
 
 import torch
 
-from sillychess.model import PlainTransformerModel, TwoStageTransformerModel
+from sillychess.model import TransformerModel
 from sillychess.san_features import FEATURE_SIZES
 from sillychess.uci_vocab import UCI_VOCAB_SIZE, UCI_PLAIN_VOCAB_SIZE
 
@@ -63,15 +63,15 @@ def resolve_device(requested: str) -> str:
 def make_batch(
     feature_sizes: Dict[str, int],
     batch_size: int,
-    block_size: int,
+    seq_len: int,
     device: str,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     x = {
-        name: torch.randint(0, size, (batch_size, block_size), dtype=torch.long, device=device)
+        name: torch.randint(0, size, (batch_size, seq_len), dtype=torch.long, device=device)
         for name, size in feature_sizes.items()
     }
     y = {
-        name: torch.randint(0, size, (batch_size, block_size), dtype=torch.long, device=device)
+        name: torch.randint(0, size, (batch_size, seq_len), dtype=torch.long, device=device)
         for name, size in feature_sizes.items()
     }
     return x, y
@@ -115,11 +115,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--w-dim", type=int, default=48)
     parser.add_argument("--rows-per-feature", type=int, default=4)
     parser.add_argument("--n-layer", type=int, default=6)
-    parser.add_argument("--n-head", type=int, default=4)
+    parser.add_argument("--n-head", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -127,15 +127,15 @@ def main() -> None:
     parser.add_argument("--with-profiler", action="store_true")
     parser.add_argument("--profile-row-limit", type=int, default=25)
     parser.add_argument("--uci-plain", action="store_true",
-                        help="profile PlainTransformerModel instead of 2D model")
+                        help="profile plain 1D model instead of composite")
     parser.add_argument("--uci", action="store_true",
-                        help="2D model with UCI head")
+                        help="composite model with UCI head")
     parser.add_argument("--lerp", action="store_true",
                         help="enable CausalLerp")
     parser.add_argument("--feat-attn", action="store_true",
                         help="enable feature attention MLP")
     parser.add_argument("--dd-rope", action="store_true",
-                        help="data-dependent RoPE on 1/4 of dims")
+                        help="data-dependent RoPE on half of dims")
     args = parser.parse_args()
     device = resolve_device(args.device)
 
@@ -143,7 +143,7 @@ def main() -> None:
 
     if args.uci_plain:
         vocab_size = UCI_PLAIN_VOCAB_SIZE
-        model = PlainTransformerModel(
+        model = TransformerModel(
             d_model=args.w_dim,
             n_head=args.n_head,
             n_layer=args.n_layer,
@@ -154,12 +154,13 @@ def main() -> None:
             use_dd_rope=args.dd_rope,
         ).to(device)
     else:
-        model = TwoStageTransformerModel(
+        model = TransformerModel(
+            feature_sizes=FEATURE_SIZES,
             w_dim=args.w_dim,
             rows_per_feature=args.rows_per_feature,
+            n_head=args.n_head,
             n_layer=args.n_layer,
             dropout=args.dropout,
-            feature_sizes=FEATURE_SIZES,
             uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
@@ -173,16 +174,15 @@ def main() -> None:
     if args.uci_plain:
         print(
             f"  mode=uci_plain device={device} batch_size={args.batch_size}"
-            f" block_size={args.block_size} d_model={args.w_dim}"
+            f" seq_len={args.seq_len} d_model={args.w_dim}"
             f" n_head={args.n_head} n_layer={args.n_layer} vocab={vocab_size}"
         )
     else:
-        total_rows = len(FEATURE_SIZES) * args.rows_per_feature
         print(
-            f"  mode=2D device={device} batch_size={args.batch_size}"
-            f" block_size={args.block_size} w_dim={args.w_dim}"
-            f" rows_per_feature={args.rows_per_feature} total_rows={total_rows}"
-            f" n_layer={args.n_layer}"
+            f"  mode=composite device={device} batch_size={args.batch_size}"
+            f" seq_len={args.seq_len} d_model={model.d_model}"
+            f" w_dim={args.w_dim} rows_per_feature={args.rows_per_feature}"
+            f" n_head={args.n_head} n_layer={args.n_layer}"
         )
     flags = []
     if args.lerp:
@@ -195,11 +195,13 @@ def main() -> None:
         print(f"  flags: +{'+'.join(flags)}")
     print(f"  params_total={total_params:,} params_trainable={trainable_params:,}")
 
-    x, y = make_batch(FEATURE_SIZES, args.batch_size, args.block_size, device)
+    x, y = make_batch(FEATURE_SIZES, args.batch_size, args.seq_len, device)
     if args.uci_plain:
-        # Override with UCI token batch
-        x = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.block_size), dtype=torch.long, device=device)}
-        y = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.block_size), dtype=torch.long, device=device)}
+        x = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.seq_len), dtype=torch.long, device=device)}
+        y = {"uci_move": torch.randint(0, vocab_size, (args.batch_size, args.seq_len), dtype=torch.long, device=device)}
+    elif args.uci:
+        # Add uci_move target for composite UCI mode
+        y["uci_move"] = torch.randint(0, UCI_VOCAB_SIZE, (args.batch_size, args.seq_len), dtype=torch.long, device=device)
 
     gc.collect()
     if device.startswith("cuda") and torch.cuda.is_available():
