@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--wsd-decay", choices=["cosine", "linear", "rsqrt"], default="cosine",
                         help="decay shape for WSD schedule")
     parser.add_argument("--w-dim", type=int, default=48)
-    parser.add_argument("--rows-per-feature", type=int, default=4)
+    parser.add_argument("--rows-per-feature", type=int, default=1)
     parser.add_argument("--n-layer", type=int, default=6)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--grad-clip", type=float, default=1.0)

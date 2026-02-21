@@ -117,7 +117,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--w-dim", type=int, default=48)
-    parser.add_argument("--rows-per-feature", type=int, default=4)
+    parser.add_argument("--rows-per-feature", type=int, default=1)
     parser.add_argument("--n-layer", type=int, default=6)
     parser.add_argument("--n-head", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.1)

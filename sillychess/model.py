@@ -306,7 +306,7 @@ class TransformerModel(nn.Module):
         # Composite mode
         feature_sizes=None,
         w_dim=48,
-        rows_per_feature=4,
+        rows_per_feature=1,
         uci_vocab_size=None,
     ):
         super().__init__()
