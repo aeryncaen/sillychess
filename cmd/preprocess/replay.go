@@ -901,15 +901,16 @@ func buildFeaturesFromMovesLite(movetext string, winner chess.Color) (*gameFeatu
 		capHint = 8
 	}
 	features := &gameFeatures{
-		Piece:     make([]int32, 0, capHint),
-		From:      make([]int32, 0, capHint),
-		To:        make([]int32, 0, capHint),
-		Capture:   make([]int32, 0, capHint),
-		Promotion: make([]int32, 0, capHint),
-		Check:     make([]int32, 0, capHint),
-		Castle:    make([]int32, 0, capHint),
-		Player:    make([]int32, 0, capHint),
-		UCIMove:   make([]int32, 0, capHint),
+		Piece:         make([]int32, 0, capHint),
+		From:          make([]int32, 0, capHint),
+		To:            make([]int32, 0, capHint),
+		Capture:       make([]int32, 0, capHint),
+		Promotion:     make([]int32, 0, capHint),
+		Check:         make([]int32, 0, capHint),
+		Castle:        make([]int32, 0, capHint),
+		Player:        make([]int32, 0, capHint),
+		UCIMove:       make([]int32, 0, capHint),
+		CompositeMove: make([]int32, 0, capHint),
 	}
 
 	inVariation := 0
@@ -977,19 +978,30 @@ func buildFeaturesFromMovesLite(movetext string, winner chess.Color) (*gameFeatu
 			return nil, false
 		}
 
-		features.Piece = append(features.Piece, int32(piece))
-		features.From = append(features.From, liteSquareIDFromIndex(from))
-		features.To = append(features.To, liteSquareIDFromIndex(to))
+		pID := int32(piece)
+		fID := liteSquareIDFromIndex(from)
+		tID := liteSquareIDFromIndex(to)
+		var capID int32
 		if capture {
-			features.Capture = append(features.Capture, 1)
-		} else {
-			features.Capture = append(features.Capture, nullID)
+			capID = 1
 		}
-		features.Promotion = append(features.Promotion, litePromotionID(promo))
-		features.Check = append(features.Check, parsed.check)
-		features.Castle = append(features.Castle, int32(parsed.castle))
-		features.Player = append(features.Player, litePlayerID(turn))
+		promoID := litePromotionID(promo)
+		chkID := parsed.check
+		castID := int32(parsed.castle)
+		plID := litePlayerID(turn)
+
+		features.Piece = append(features.Piece, pID)
+		features.From = append(features.From, fID)
+		features.To = append(features.To, tID)
+		features.Capture = append(features.Capture, capID)
+		features.Promotion = append(features.Promotion, promoID)
+		features.Check = append(features.Check, chkID)
+		features.Castle = append(features.Castle, castID)
+		features.Player = append(features.Player, plID)
 		features.UCIMove = append(features.UCIMove, uciMoveID(from, to, litePromoChar(promo)))
+		features.CompositeMove = append(features.CompositeMove, compositeMoveID(
+			pID, fID, tID, capID, promoID, chkID, castID, plID,
+		))
 	}
 
 	if len(features.Piece) == 0 {

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,15 +33,16 @@ const (
 )
 
 type gameFeatures struct {
-	Piece     []int32 `parquet:"name=piece, type=INT32, repetitiontype=REPEATED"`
-	From      []int32 `parquet:"name=from_square, type=INT32, repetitiontype=REPEATED"`
-	To        []int32 `parquet:"name=to_square, type=INT32, repetitiontype=REPEATED"`
-	Capture   []int32 `parquet:"name=capture, type=INT32, repetitiontype=REPEATED"`
-	Promotion []int32 `parquet:"name=promotion, type=INT32, repetitiontype=REPEATED"`
-	Check     []int32 `parquet:"name=check, type=INT32, repetitiontype=REPEATED"`
-	Castle    []int32 `parquet:"name=castle, type=INT32, repetitiontype=REPEATED"`
-	Player    []int32 `parquet:"name=player, type=INT32, repetitiontype=REPEATED"`
-	UCIMove   []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
+	Piece         []int32 `parquet:"name=piece, type=INT32, repetitiontype=REPEATED"`
+	From          []int32 `parquet:"name=from_square, type=INT32, repetitiontype=REPEATED"`
+	To            []int32 `parquet:"name=to_square, type=INT32, repetitiontype=REPEATED"`
+	Capture       []int32 `parquet:"name=capture, type=INT32, repetitiontype=REPEATED"`
+	Promotion     []int32 `parquet:"name=promotion, type=INT32, repetitiontype=REPEATED"`
+	Check         []int32 `parquet:"name=check, type=INT32, repetitiontype=REPEATED"`
+	Castle        []int32 `parquet:"name=castle, type=INT32, repetitiontype=REPEATED"`
+	Player        []int32 `parquet:"name=player, type=INT32, repetitiontype=REPEATED"`
+	UCIMove       []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
+	CompositeMove []int32 `parquet:"name=composite_move, type=INT32, repetitiontype=REPEATED"`
 }
 
 type pgnJob struct {
@@ -61,6 +63,51 @@ var uciDecoder = chess.UCINotation{}
 
 // UCI vocab: move string → 1-indexed ID (0 = null/padding, consistent with other features)
 var uciVocab map[string]int32
+
+// Composite vocab: 8-feature tuple → 1-indexed ID
+type compositeTuple [8]int32
+
+var compositeVocab map[compositeTuple]int32
+
+func loadCompositeVocab(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	compositeVocab = make(map[compositeTuple]int32)
+	scanner := bufio.NewScanner(f)
+	var id int32
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 8 {
+			continue
+		}
+		var tup compositeTuple
+		for i, p := range parts {
+			val, _ := strconv.Atoi(p)
+			tup[i] = int32(val)
+		}
+		compositeVocab[tup] = id + 1 // 1-indexed
+		id++
+	}
+	return scanner.Err()
+}
+
+func compositeMoveID(piece, fromSq, toSq, capture, promotion, check, castle, player int32) int32 {
+	if compositeVocab == nil {
+		return nullID
+	}
+	tup := compositeTuple{piece, fromSq, toSq, capture, promotion, check, castle, player}
+	if id, ok := compositeVocab[tup]; ok {
+		return id
+	}
+	return nullID
+}
 
 func loadUCIVocab(path string) error {
 	f, err := os.Open(path)
@@ -341,15 +388,16 @@ func buildFeaturesFromMoves(movetext string, winner chess.Color) (*gameFeatures,
 		capHint = 8
 	}
 	features := &gameFeatures{
-		Piece:     make([]int32, 0, capHint),
-		From:      make([]int32, 0, capHint),
-		To:        make([]int32, 0, capHint),
-		Capture:   make([]int32, 0, capHint),
-		Promotion: make([]int32, 0, capHint),
-		Check:     make([]int32, 0, capHint),
-		Castle:    make([]int32, 0, capHint),
-		Player:    make([]int32, 0, capHint),
-		UCIMove:   make([]int32, 0, capHint),
+		Piece:         make([]int32, 0, capHint),
+		From:          make([]int32, 0, capHint),
+		To:            make([]int32, 0, capHint),
+		Capture:       make([]int32, 0, capHint),
+		Promotion:     make([]int32, 0, capHint),
+		Check:         make([]int32, 0, capHint),
+		Castle:        make([]int32, 0, capHint),
+		Player:        make([]int32, 0, capHint),
+		UCIMove:       make([]int32, 0, capHint),
+		CompositeMove: make([]int32, 0, capHint),
 	}
 
 	inVariation := 0
@@ -413,16 +461,28 @@ func buildFeaturesFromMoves(movetext string, winner chess.Color) (*gameFeatures,
 		}
 		nextPos := pos.Update(move)
 
-		features.Piece = append(features.Piece, pieceIDFromToken(moveStr, pos, move))
-		features.From = append(features.From, squareID(move.S1()))
-		features.To = append(features.To, squareID(move.S2()))
-		features.Capture = append(features.Capture, captureID(move))
-		features.Promotion = append(features.Promotion, promotionID(move.Promo()))
-		features.Castle = append(features.Castle, castleID(move))
-		features.Player = append(features.Player, playerID(pos.Turn()))
-		features.Check = append(features.Check, checkIDFromToken(moveStr, move))
+		pID := pieceIDFromToken(moveStr, pos, move)
+		fID := squareID(move.S1())
+		tID := squareID(move.S2())
+		capID := captureID(move)
+		promoID := promotionID(move.Promo())
+		chkID := checkIDFromToken(moveStr, move)
+		castID := castleID(move)
+		plID := playerID(pos.Turn())
+
+		features.Piece = append(features.Piece, pID)
+		features.From = append(features.From, fID)
+		features.To = append(features.To, tID)
+		features.Capture = append(features.Capture, capID)
+		features.Promotion = append(features.Promotion, promoID)
+		features.Check = append(features.Check, chkID)
+		features.Castle = append(features.Castle, castID)
+		features.Player = append(features.Player, plID)
 		features.UCIMove = append(features.UCIMove, uciMoveID(
 			int(move.S1()), int(move.S2()), chessPromoChar(move.Promo()),
+		))
+		features.CompositeMove = append(features.CompositeMove, compositeMoveID(
+			pID, fID, tID, capID, promoID, chkID, castID, plID,
 		))
 
 		pos = nextPos
@@ -545,10 +605,12 @@ func main() {
 	var outDir string
 	var maxGames int
 	var vocabPath string
+	var compositeVocabPath string
 	flag.StringVar(&pgnPath, "pgn", "", "path to PGN (.pgn or .pgn.zst)")
 	flag.StringVar(&outDir, "out", "", "output directory for parquet shards")
 	flag.IntVar(&maxGames, "max-games", 0, "optional cap on processed decisive games")
 	flag.StringVar(&vocabPath, "vocab", "uci_vocab.txt", "path to UCI move vocab (from vocabbuilder)")
+	flag.StringVar(&compositeVocabPath, "composite-vocab", "composite_vocab.txt", "path to composite vocab (from compositevocab)")
 	flag.Parse()
 
 	if pgnPath == "" || outDir == "" {
@@ -560,6 +622,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: could not load UCI vocab from %s: %v (uci_move column will be zeros)\n", vocabPath, err)
 	} else {
 		fmt.Fprintf(os.Stderr, "loaded UCI vocab: %d moves\n", len(uciVocab))
+	}
+
+	if err := loadCompositeVocab(compositeVocabPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load composite vocab from %s: %v (composite_move column will be zeros)\n", compositeVocabPath, err)
+	} else {
+		fmt.Fprintf(os.Stderr, "loaded composite vocab: %d tuples\n", len(compositeVocab))
 	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {

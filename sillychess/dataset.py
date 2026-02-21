@@ -135,7 +135,13 @@ class CachedChessDataset(Dataset):
         feature_names = list(FEATURE_IDS.keys())
         df = pd.read_parquet(path)
         has_uci = "uci_move" in df.columns
-        cols = feature_names + (["uci_move"] if has_uci else [])
+        has_comp = "composite_move" in df.columns
+        extra_cols = []
+        if has_uci:
+            extra_cols.append("uci_move")
+        if has_comp:
+            extra_cols.append("composite_move")
+        cols = feature_names + extra_cols
         col_arrays = {name: df[name].values for name in cols}
         for idx in range(len(df)):
             feature_seq = {}
@@ -145,6 +151,9 @@ class CachedChessDataset(Dataset):
             if has_uci:
                 val = col_arrays["uci_move"][idx]
                 feature_seq["uci_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
+            if has_comp:
+                val = col_arrays["composite_move"][idx]
+                feature_seq["composite_move"] = (np.asarray(val, dtype=np.int32) - 1) if val is not None else np.empty(0, dtype=np.int32)
             self.sequences.append(feature_seq)
 
     def _load_one_pt(self, path):
@@ -298,6 +307,22 @@ class CachedChessDataset(Dataset):
             t_uci = torch.from_numpy(arr)
             feat_x["uci_move"] = t_uci[:-1]
             feat_y["uci_move"] = t_uci[1:]
+
+        # composite_move for loss target (precomputed or on-the-fly)
+        if "composite_move" in seq:
+            arr = np.asarray(seq["composite_move"], dtype=np.int64)
+            if len(arr) < padded_len:
+                arr = np.pad(arr, (0, padded_len - len(arr)), constant_values=-1)
+            t_comp = torch.from_numpy(arr)
+            feat_x["composite_move"] = t_comp[:-1]
+            feat_y["composite_move"] = t_comp[1:]
+        else:
+            # Fallback: compute from features
+            from sillychess.composite_vocab import tuples_to_ids_np
+            comp_ids = tuples_to_ids_np(stacked).astype(np.int64)
+            t_comp = torch.from_numpy(comp_ids)
+            feat_x["composite_move"] = t_comp[:-1]
+            feat_y["composite_move"] = t_comp[1:]
 
         return feat_x, feat_y
 

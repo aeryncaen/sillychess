@@ -11,7 +11,8 @@ from sillychess.dataset import (
 )
 from sillychess.eval import eval_legality, eval_loss, eval_loss_uci, eval_legality_uci
 from sillychess.model import TransformerModel
-from sillychess.san_features import FEATURE_SIZES, FEATURE_ORDER
+from sillychess.composite_vocab import COMPOSITE_TUPLES
+from sillychess.san_features import FEATURE_SIZES
 from sillychess.uci_vocab import UCI_VOCAB_SIZE, UCI_PLAIN_VOCAB_SIZE, PAD_ID
 
 
@@ -149,6 +150,7 @@ def main():
             n_layer=args.n_layer,
             dropout=args.dropout,
             uci_vocab_size=UCI_VOCAB_SIZE if args.uci else None,
+            composite_vocab=None if args.uci else COMPOSITE_TUPLES,
             use_lerp=args.lerp,
             use_feat_attn=args.feat_attn,
             use_dd_rope=args.dd_rope,
@@ -264,27 +266,18 @@ def main():
                 train_acc = ((preds == uci_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
             else:
                 pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
-                denom = pad_mask.sum().clamp_min(1.0)
-                # Extract per-feature targets from stacked (B, T, 9) tensor
-                feat_targets = feat_y["features"]
-                feature_losses = []
-                all_correct = (pad_mask > 0)  # start True for non-pad positions
-                for i, name in enumerate(FEATURE_ORDER):
-                    logits = outputs[name]
-                    targets = feat_targets[:, :, i]
-                    raw = torch.nn.functional.cross_entropy(
-                        logits.reshape(-1, logits.size(-1)),
-                        targets.reshape(-1),
-                        reduction="none",
-                    )
-                    raw = raw.view(pad_mask.shape)
-                    feature_losses.append((raw * pad_mask).sum() / denom)
-                    all_correct = all_correct & (logits.argmax(dim=-1) == targets)
-                # Contraharmonic mean: sum(L_i^2) / sum(L_i)
-                # Upweights harder features, prevents fast learners from dominating
-                stacked = torch.stack(feature_losses)
-                loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
-                train_acc = all_correct.sum().item() / denom.item()
+                comp_targets = feat_y["composite_move"]
+                valid = (comp_targets >= 0) & (pad_mask > 0)
+                comp_targets_safe = comp_targets.clamp(min=0)
+                raw = torch.nn.functional.cross_entropy(
+                    outputs.reshape(-1, outputs.size(-1)),
+                    comp_targets_safe.reshape(-1),
+                    reduction="none",
+                )
+                raw = raw.view(pad_mask.shape)
+                loss = (raw * valid.float()).sum() / valid.float().sum().clamp_min(1.0)
+                preds = outputs.argmax(dim=-1)
+                train_acc = ((preds == comp_targets_safe) & valid).sum().item() / valid.sum().clamp_min(1).item()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             grad_norm = None

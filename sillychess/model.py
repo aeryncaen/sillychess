@@ -230,38 +230,35 @@ class TransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Output head: per-feature classifiers (non-UCI mode)
+# Output head: composite vocab (non-UCI mode)
 # ---------------------------------------------------------------------------
 
-class FeatureOutputHead(nn.Module):
-    """Per-feature classifiers with weights tied to the input embedding.
+class CompositeOutputHead(nn.Module):
+    """Single softmax over composite vocab, weights tied to input embedding.
 
-    Input: (B, T, total_rows, DD).  Output: dict of {feature_name: (B, T, n_classes)}.
+    For each of the V vocab entries (a tuple of 8 feature IDs), the weight
+    vector is built by looking up each feature ID in the shared embedding
+    table (with per-feature offsets) and concatenating — the exact same
+    operation as CompositeSANEmbedding.
 
-    Each feature's classifier reuses the corresponding rows of the shared
-    embedding table — same idea as LM head weight tying.
+    Computed fresh each forward pass: one gather of V*8 embeddings + reshape
+    + normalize.  No Python loops.
     """
 
-    def __init__(self, feature_sizes, rows_per_feature, embed_weight, offsets):
+    def __init__(self, vocab_tuples, embed_weight, offsets):
         super().__init__()
-        self.feature_names = list(feature_sizes.keys())
-        self.sizes = [feature_sizes[n] for n in self.feature_names]
-        self.rows_per_feature = rows_per_feature
-        self.embed_weight = embed_weight  # reference, not a copy
-        self.offsets = offsets             # (n_features,) int64 buffer
+        # vocab_tuples: (V, 8) long tensor of feature IDs
+        # Pre-add offsets → absolute indices into the shared embedding table
+        abs_ids = vocab_tuples + offsets.unsqueeze(0)          # (V, 8)
+        self.register_buffer('abs_ids', abs_ids)
+        self.embed_weight = embed_weight                       # reference to nn.Embedding.weight
 
     def forward(self, x):
-        """x: (B, T, total_rows, DD) -> dict of {name: (B, T, n_classes)}"""
-        rpf = self.rows_per_feature
-        outputs = {}
-        for idx, name in enumerate(self.feature_names):
-            start = idx * rpf
-            chunk = x[:, :, start:start + rpf, :]
-            flat = chunk.reshape(x.shape[0], x.shape[1], -1)    # (B, T, rpf*DD)
-            w = self.embed_weight[self.offsets[idx]:self.offsets[idx] + self.sizes[idx]]  # (n_classes, rpf*DD)
-            w = F.normalize(w, dim=-1)
-            outputs[name] = F.linear(flat, w)
-        return outputs
+        """x: (B, T, d_model) -> (B, T, V)"""
+        w = self.embed_weight[self.abs_ids]                    # (V, 8, rpf*w_dim)
+        w = w.reshape(w.shape[0], -1)                          # (V, d_model)
+        w = F.normalize(w, dim=-1)
+        return F.linear(x, w)                                  # (B, T, V)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +293,7 @@ class TransformerModel(nn.Module):
         w_dim=48,
         rows_per_feature=1,
         uci_vocab_size=None,
+        composite_vocab=None,
     ):
         super().__init__()
 
@@ -334,9 +332,10 @@ class TransformerModel(nn.Module):
         elif self.uci_mode:
             self.head = nn.Linear(d_model, uci_vocab_size, bias=False)
         else:
-            self.output_head = FeatureOutputHead(
-                feature_sizes, rows_per_feature,
-                self.embed.embed.weight, self.embed.offsets,
+            if composite_vocab is None:
+                raise ValueError("composite_vocab required for non-UCI composite mode")
+            self.output_head = CompositeOutputHead(
+                composite_vocab, self.embed.embed.weight, self.embed.offsets,
             )
 
         self._init_weights(n_layer)
@@ -375,7 +374,6 @@ class TransformerModel(nn.Module):
         x = self.ln_f(x)
 
         if self.embed_mode == "composite" and not self.uci_mode:
-            x = x.view(B, T, self._total_rows, self._w_dim)
-            return self.output_head(x)                     # dict of {name: (B, T, n_classes)}
+            return self.output_head(x)                     # (B, T, composite_vocab_size)
 
         return self.head(x)                                # (B, T, vocab_size)

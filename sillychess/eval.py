@@ -5,16 +5,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from sillychess.composite_vocab import COMPOSITE_TUPLES
 from sillychess.dataset import BucketBatchSampler
 from sillychess.san_features import FEATURE_IDS, FEATURE_ORDER, FEATURE_SPECS
 from sillychess.uci_vocab import UCI_MOVES, PAD_ID, BOG_ID, MOVE_OFFSET
 
 
 def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
-    """Compute average cross-entropy loss on a random subset of the eval set.
-
-    For non-UCI (per-feature head) models.
-    """
+    """Compute average cross-entropy loss on eval set for composite vocab model."""
     sampler = BucketBatchSampler(eval_dataset.bucket_ids, batch_size, shuffle=False)
     loader = DataLoader(eval_dataset, batch_sampler=sampler)
     model.eval()
@@ -29,37 +27,33 @@ def eval_loss(model, eval_dataset, batch_size, device, max_batches=16):
             feat_x = {name: t.to(device) for name, t in feat_x.items()}
             feat_y = {name: t.to(device) for name, t in feat_y.items()}
 
-            outputs = model(feat_x)
-            pad_mask = (feat_y["features"][:, :, 0] != 0).float()  # piece != 0
-            denom = pad_mask.sum().clamp_min(1.0)
+            logits = model(feat_x)                         # (B, T, V)
+            pad_mask = feat_y["features"][:, :, 0] != 0    # piece != 0
+            comp_targets = feat_y["composite_move"]
+            valid = (comp_targets >= 0) & pad_mask
+            comp_targets_safe = comp_targets.clamp(min=0)
 
-            feat_targets = feat_y["features"]
-            feature_losses = []
-            all_correct = (pad_mask > 0)
-            for fi, name in enumerate(FEATURE_ORDER):
-                logits = outputs[name]
-                targets = feat_targets[:, :, fi]
-                raw = torch.nn.functional.cross_entropy(
-                    logits.reshape(-1, logits.size(-1)),
-                    targets.reshape(-1),
-                    reduction="none",
-                )
-                raw = raw.view(pad_mask.shape)
-                feature_losses.append((raw * pad_mask).sum() / denom)
-                all_correct = all_correct & (logits.argmax(dim=-1) == targets)
+            raw = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                comp_targets_safe.reshape(-1),
+                reduction="none",
+            )
+            raw = raw.view(valid.shape)
+            n_valid = valid.float().sum().clamp_min(1.0)
+            batch_loss = (raw * valid.float()).sum() / n_valid
 
-            # Contraharmonic mean (matches train.py)
-            stacked = torch.stack(feature_losses)
-            batch_loss = stacked.square().sum() / stacked.sum().clamp_min(1e-8)
-            n_tokens = denom.item()
+            preds = logits.argmax(dim=-1)
+            n_correct = ((preds == comp_targets_safe) & valid).sum().item()
+            n_tokens = n_valid.item()
+
             total_loss += batch_loss.item() * n_tokens
-            total_correct += all_correct.sum().item()
+            total_correct += n_correct
             total_tokens += n_tokens
 
     model.train()
     if total_tokens == 0:
         return float("nan"), 0.0
-    return total_loss / total_tokens, total_correct / max(1, total_tokens)
+    return total_loss / total_tokens, total_correct / total_tokens
 
 
 # Reverse lookups for legality checking
@@ -86,10 +80,10 @@ def _id_to_move(from_id, to_id, promo_id):
 
 
 def eval_legality(model, eval_sequences, device, max_games=50):
-    """Check move legality on complete eval games (per-feature head model).
+    """Check move legality on complete eval games (composite vocab model).
 
     Runs one forward pass per game on the full sequence, then replays
-    the board and checks top-1 predicted from/to/promotion at each step.
+    the board and checks top-1 predicted composite tuple at each step.
 
     Returns (legal_count, total_count).
     """
@@ -97,6 +91,7 @@ def eval_legality(model, eval_sequences, device, max_games=50):
     seqs = eval_sequences[:max_games]
     legal = 0
     total = 0
+    comp_tuples = COMPOSITE_TUPLES  # (V, 8)
 
     with torch.no_grad():
         for game_seq in seqs:
@@ -109,7 +104,7 @@ def eval_legality(model, eval_sequences, device, max_games=50):
             stacked = np.stack([np.asarray(game_seq[n], dtype=np.int64) for n in feature_names], axis=-1)
             feat_x = {"features": torch.from_numpy(stacked).unsqueeze(0).to(device)}
 
-            out = model(feat_x)  # dict of {name: (1, T, n_classes)}
+            logits = model(feat_x)  # (1, T, V)
 
             # Replay board and check legality at each position.
             # Output at position t predicts move t+1 (next-token prediction),
@@ -131,10 +126,12 @@ def eval_legality(model, eval_sequences, device, max_games=50):
                 except (ValueError, AssertionError):
                     break
 
-                # Now check: is the model's predicted next move legal here?
-                from_id = out["from_square"][0, t].argmax(-1).item()
-                to_id = out["to_square"][0, t].argmax(-1).item()
-                promo_id = out["promotion"][0, t].argmax(-1).item()
+                # Decode predicted composite tuple → chess.Move
+                pred_id = logits[0, t].argmax(-1).item()
+                tup = comp_tuples[pred_id]
+                from_id = tup[1].item()   # from_square
+                to_id = tup[2].item()     # to_square
+                promo_id = tup[4].item()  # promotion
 
                 move = _id_to_move(from_id, to_id, promo_id)
                 if move is not None and move in board.legal_moves:

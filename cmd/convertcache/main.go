@@ -1,5 +1,6 @@
 // convertcache reads old-format parquet shards (with step column and
-// 4-value player) and writes new-format shards (no step, 2-value player).
+// 4-value player) and writes new-format shards (no step, 2-value player,
+// composite_move column).
 //
 // Player mapping:
 //
@@ -10,16 +11,19 @@
 //
 // Usage:
 //
-//	convertcache -in data/cache/old -out data/cache/new
+//	convertcache -in data/cache/old -out data/cache/new -composite-vocab composite_vocab.txt
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/xitongsys/parquet-go-source/local"
@@ -41,17 +45,63 @@ type oldGameFeatures struct {
 	UCIMove   []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
 }
 
-// New schema (writing) — no Step, same Player field (values remapped)
+// New schema (writing) — no Step, remapped Player, + CompositeMove
 type newGameFeatures struct {
-	Piece     []int32 `parquet:"name=piece, type=INT32, repetitiontype=REPEATED"`
-	From      []int32 `parquet:"name=from_square, type=INT32, repetitiontype=REPEATED"`
-	To        []int32 `parquet:"name=to_square, type=INT32, repetitiontype=REPEATED"`
-	Capture   []int32 `parquet:"name=capture, type=INT32, repetitiontype=REPEATED"`
-	Promotion []int32 `parquet:"name=promotion, type=INT32, repetitiontype=REPEATED"`
-	Check     []int32 `parquet:"name=check, type=INT32, repetitiontype=REPEATED"`
-	Castle    []int32 `parquet:"name=castle, type=INT32, repetitiontype=REPEATED"`
-	Player    []int32 `parquet:"name=player, type=INT32, repetitiontype=REPEATED"`
-	UCIMove   []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
+	Piece         []int32 `parquet:"name=piece, type=INT32, repetitiontype=REPEATED"`
+	From          []int32 `parquet:"name=from_square, type=INT32, repetitiontype=REPEATED"`
+	To            []int32 `parquet:"name=to_square, type=INT32, repetitiontype=REPEATED"`
+	Capture       []int32 `parquet:"name=capture, type=INT32, repetitiontype=REPEATED"`
+	Promotion     []int32 `parquet:"name=promotion, type=INT32, repetitiontype=REPEATED"`
+	Check         []int32 `parquet:"name=check, type=INT32, repetitiontype=REPEATED"`
+	Castle        []int32 `parquet:"name=castle, type=INT32, repetitiontype=REPEATED"`
+	Player        []int32 `parquet:"name=player, type=INT32, repetitiontype=REPEATED"`
+	UCIMove       []int32 `parquet:"name=uci_move, type=INT32, repetitiontype=REPEATED"`
+	CompositeMove []int32 `parquet:"name=composite_move, type=INT32, repetitiontype=REPEATED"`
+}
+
+// Composite vocab: 8-feature tuple → 1-indexed ID
+type compositeTuple [8]int32
+
+var compositeVocab map[compositeTuple]int32
+
+func loadCompositeVocab(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	compositeVocab = make(map[compositeTuple]int32)
+	scanner := bufio.NewScanner(f)
+	var id int32
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) != 8 {
+			continue
+		}
+		var tup compositeTuple
+		for i, p := range parts {
+			val, _ := strconv.Atoi(p)
+			tup[i] = int32(val)
+		}
+		compositeVocab[tup] = id + 1 // 1-indexed
+		id++
+	}
+	return scanner.Err()
+}
+
+func compositeMoveID(piece, fromSq, toSq, capture, promotion, check, castle, player int32) int32 {
+	if compositeVocab == nil {
+		return 0
+	}
+	tup := compositeTuple{piece, fromSq, toSq, capture, promotion, check, castle, player}
+	if id, ok := compositeVocab[tup]; ok {
+		return id
+	}
+	return 0
 }
 
 func remapPlayer(old int32) int32 {
@@ -123,21 +173,27 @@ func convertShard(inPath, outPath string) (int, error) {
 		}
 		for i := range rows {
 			old := &rows[i]
-			// Remap player values
-			newPlayer := make([]int32, len(old.Player))
-			for j, p := range old.Player {
-				newPlayer[j] = remapPlayer(p)
+			nMoves := len(old.Piece)
+			newPlayer := make([]int32, nMoves)
+			compMove := make([]int32, nMoves)
+			for j := 0; j < nMoves; j++ {
+				newPlayer[j] = remapPlayer(old.Player[j])
+				compMove[j] = compositeMoveID(
+					old.Piece[j], old.From[j], old.To[j], old.Capture[j],
+					old.Promotion[j], old.Check[j], old.Castle[j], newPlayer[j],
+				)
 			}
 			out := newGameFeatures{
-				Piece:     old.Piece,
-				From:      old.From,
-				To:        old.To,
-				Capture:   old.Capture,
-				Promotion: old.Promotion,
-				Check:     old.Check,
-				Castle:    old.Castle,
-				Player:    newPlayer,
-				UCIMove:   old.UCIMove,
+				Piece:         old.Piece,
+				From:          old.From,
+				To:            old.To,
+				Capture:       old.Capture,
+				Promotion:     old.Promotion,
+				Check:         old.Check,
+				Castle:        old.Castle,
+				Player:        newPlayer,
+				UCIMove:       old.UCIMove,
+				CompositeMove: compMove,
 			}
 			if err := pw.Write(out); err != nil {
 				closePW()
@@ -154,15 +210,22 @@ func convertShard(inPath, outPath string) (int, error) {
 }
 
 func main() {
-	var inDir, outDir string
+	var inDir, outDir, compositeVocabPath string
 	flag.StringVar(&inDir, "in", "", "input directory with old-format shard-*.parquet files")
 	flag.StringVar(&outDir, "out", "", "output directory for new-format shards")
+	flag.StringVar(&compositeVocabPath, "composite-vocab", "composite_vocab.txt", "path to composite vocab")
 	flag.Parse()
 
 	if inDir == "" || outDir == "" {
 		fmt.Fprintln(os.Stderr, "usage: convertcache -in <old-cache-dir> -out <new-cache-dir>")
 		os.Exit(2)
 	}
+
+	if err := loadCompositeVocab(compositeVocabPath); err != nil {
+		fmt.Fprintf(os.Stderr, "error: could not load composite vocab from %s: %v\n", compositeVocabPath, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "loaded composite vocab: %d tuples\n", len(compositeVocab))
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
