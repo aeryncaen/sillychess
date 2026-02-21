@@ -358,10 +358,7 @@ def main():
 
             # --- Eval ---
             if eval_dataset is not None and step % args.eval_every == 0:
-                if args.uci_plain:
-                    val = eval_loss_uci(model, eval_dataset, args.batch_size, device)
-                    tqdm.write(f"  eval step={step}: val_loss={val:.4f}")
-                elif args.uci:
+                if args.uci_plain or args.uci:
                     val = eval_loss_uci(model, eval_dataset, args.batch_size, device)
                     leg, leg_total = eval_legality_uci(
                         model, eval_dataset.sequences, args.block_size, device,
