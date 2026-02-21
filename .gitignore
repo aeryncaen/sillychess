@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Go
+.gocache/
+
+# Data
+data/
+*.pgn
+*.pgn.zst
+*.parquet
+
+# Model artifacts
+*.pt
+
+# Compiled Go binary
+preprocess
+
+# OS
+.DS_Store
