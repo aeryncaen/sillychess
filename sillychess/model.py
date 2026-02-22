@@ -197,13 +197,12 @@ class TransformerBlock(nn.Module):
         if use_feat_attn:
             assert n_features is not None, "n_features required for feat_attn"
             self.n_features = n_features
-            feat_dim = d_model // n_features
-            self.feat_dim = feat_dim
-            self.feat_q = nn.Linear(d_model, d_model, bias=False)
-            self.feat_k = nn.Linear(d_model, d_model, bias=False)
-            self.feat_v = nn.Linear(d_model, d_model, bias=False)
-            self.feat_down = nn.Linear(d_model, d_model, bias=False)
-            self.feat_qk_norm = nn.RMSNorm(feat_dim)
+            self.feat_head_dim = ffn_dim // n_features
+            self.feat_q = nn.Linear(d_model, ffn_dim, bias=False)
+            self.feat_k = nn.Linear(d_model, ffn_dim, bias=False)
+            self.feat_v = nn.Linear(d_model, ffn_dim, bias=False)
+            self.feat_down = nn.Linear(ffn_dim, d_model, bias=False)
+            self.feat_qk_norm = nn.RMSNorm(self.feat_head_dim)
         else:
             self.gate_proj = nn.Linear(d_model, ffn_dim, bias=False)
             self.up_proj = nn.Linear(d_model, ffn_dim, bias=False)
@@ -249,13 +248,13 @@ class TransformerBlock(nn.Module):
         # MLP
         h = self.mlp_norm(x)
         if self.use_feat_attn:
-            nf, fd = self.n_features, self.feat_dim
-            q = self.feat_qk_norm(self.feat_q(h).view(B * T, nf, fd))  # (B*T, nf, fd)
-            k = self.feat_qk_norm(self.feat_k(h).view(B * T, nf, fd))
-            v = self.feat_v(h).view(B * T, nf, fd)
-            # attend over nf=8 features, head_dim=fd=48
+            nf, fhd = self.n_features, self.feat_head_dim
+            q = self.feat_qk_norm(self.feat_q(h).view(B * T, nf, fhd))  # (B*T, 8, 128)
+            k = self.feat_qk_norm(self.feat_k(h).view(B * T, nf, fhd))
+            v = self.feat_v(h).view(B * T, nf, fhd)
+            # attend over nf=8 features, head_dim=ffn_dim//nf=128
             feat_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-            feat_out = feat_out.view(B, T, D)
+            feat_out = feat_out.view(B, T, nf * fhd)
             x = x + self.mlp_drop(self.feat_down(feat_out))
         else:
             x = x + self.mlp_drop(self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h)))
