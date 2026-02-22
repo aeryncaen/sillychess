@@ -164,7 +164,7 @@ class TransformerBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_head, dropout=0.1, use_lerp=False, use_feat_attn=False,
-                 use_dd_rope=False):
+                 use_dd_rope=False, n_features=None):
         super().__init__()
         assert d_model % n_head == 0
         self.n_head = n_head
@@ -195,10 +195,15 @@ class TransformerBlock(nn.Module):
         self.mlp_norm = nn.RMSNorm(d_model)
 
         if use_feat_attn:
-            self.feat_gate = nn.Linear(d_model, ffn_dim, bias=False)
-            self.feat_up = nn.Linear(d_model, ffn_dim, bias=False)
-            self.feat_down = nn.Linear(ffn_dim, d_model, bias=False)
-            self.feat_qk_norm = nn.RMSNorm(ffn_dim // n_head)
+            assert n_features is not None, "n_features required for feat_attn"
+            self.n_features = n_features
+            feat_dim = d_model // n_features
+            self.feat_dim = feat_dim
+            self.feat_q = nn.Linear(d_model, d_model, bias=False)
+            self.feat_k = nn.Linear(d_model, d_model, bias=False)
+            self.feat_v = nn.Linear(d_model, d_model, bias=False)
+            self.feat_down = nn.Linear(d_model, d_model, bias=False)
+            self.feat_qk_norm = nn.RMSNorm(feat_dim)
         else:
             self.gate_proj = nn.Linear(d_model, ffn_dim, bias=False)
             self.up_proj = nn.Linear(d_model, ffn_dim, bias=False)
@@ -244,15 +249,13 @@ class TransformerBlock(nn.Module):
         # MLP
         h = self.mlp_norm(x)
         if self.use_feat_attn:
-            gate = self.feat_gate(h)                       # (B, T, ffn_dim)
-            val = self.feat_up(h)                          # (B, T, ffn_dim)
-            ffn_dim = gate.shape[-1]
-            fdh = ffn_dim // nh
-            gate = gate.view(B * T, 1, nh, fdh)
-            gate = self.feat_qk_norm(gate)
-            val = val.view(B * T, 1, nh, fdh)
-            feat_out = F.scaled_dot_product_attention(gate, gate, val, is_causal=False)
-            feat_out = feat_out.view(B, T, ffn_dim)
+            nf, fd = self.n_features, self.feat_dim
+            q = self.feat_qk_norm(self.feat_q(h).view(B * T, nf, fd))  # (B*T, nf, fd)
+            k = self.feat_qk_norm(self.feat_k(h).view(B * T, nf, fd))
+            v = self.feat_v(h).view(B * T, nf, fd)
+            # attend over nf=8 features, head_dim=fd=48
+            feat_out = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+            feat_out = feat_out.view(B, T, D)
             x = x + self.mlp_drop(self.feat_down(feat_out))
         else:
             x = x + self.mlp_drop(self.down_proj(F.silu(self.gate_proj(h)) * self.up_proj(h)))
@@ -264,33 +267,18 @@ class TransformerBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class CompositeOutputHead(nn.Module):
-    """Single softmax over composite vocab with its own descriptor table.
+    """Plain linear projection to composite vocab.
 
-    Owns an independent nn.Embedding(n_classes, rpf*w_dim) — same shape as
-    the input embedding table but separate parameters.  For each of the V
-    vocab entries (a tuple of 8 feature IDs), the weight vector is built by
-    looking up each feature ID and concatenating, same as CompositeSANEmbedding.
-
-    Computed fresh each forward pass: one gather + reshape + normalize.
+    Direct (V, d_model) weight matrix — no factored embedding indirection.
     """
 
-    def __init__(self, vocab_tuples, n_classes, rpf_w_dim, offsets):
+    def __init__(self, vocab_size, d_model):
         super().__init__()
-        # vocab_tuples: (V, 8) long tensor of feature IDs
-        # Pre-add offsets → absolute indices into our own embedding table
-        abs_ids = vocab_tuples + offsets.unsqueeze(0)          # (V, 8)
-        self.register_buffer('abs_ids', abs_ids)
-        self.embed = nn.Embedding(n_classes, rpf_w_dim)
-
-    def _weight(self):
-        """Build (V, d_model) weight matrix from own descriptor table."""
-        w = self.embed.weight[self.abs_ids]                    # (V, 8, rpf*w_dim)
-        w = w.reshape(w.shape[0], -1)                          # (V, d_model)
-        return F.normalize(w, dim=-1)
+        self.proj = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, x):
         """x: (B, T, d_model) -> (B, T, V)"""
-        return F.linear(x, self._weight())                     # (B, T, V)
+        return self.proj(x)
 
     def chunked_loss(self, x, targets, mask, chunk_tokens=4096):
         """Chunked cross-entropy loss — never materializes full (B*T, V) logits.
@@ -304,7 +292,7 @@ class CompositeOutputHead(nn.Module):
         Returns:
             (loss, n_correct, n_valid) — scalar loss, int counts.
         """
-        w = self._weight()                                     # (V, d_model)
+        w = self.proj.weight                                     # (V, d_model)
         B, T, D = x.shape
         x_flat = x.reshape(B * T, D)
         tgt_flat = targets.reshape(B * T).clamp(min=0)
@@ -405,8 +393,10 @@ class TransformerModel(nn.Module):
         inv_freq = 1.0 / (10000.0 ** (torch.arange(0, d_head, 2).float() / d_head))
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
+        n_feat = len(feature_sizes) if feature_sizes is not None else None
         self.layers = nn.ModuleList([
-            TransformerBlock(d_model, n_head, dropout, use_lerp, use_feat_attn, use_dd_rope)
+            TransformerBlock(d_model, n_head, dropout, use_lerp, use_feat_attn, use_dd_rope,
+                             n_features=n_feat)
             for _ in range(n_layer)
         ])
         self.ln_f = nn.RMSNorm(d_model)
@@ -419,11 +409,7 @@ class TransformerModel(nn.Module):
         else:
             if composite_vocab is None:
                 raise ValueError("composite_vocab required for non-UCI composite mode")
-            n_classes = sum(feature_sizes.values())
-            rpf_w_dim = rows_per_feature * w_dim
-            self.output_head = CompositeOutputHead(
-                composite_vocab, n_classes, rpf_w_dim, self.embed.offsets,
-            )
+            self.output_head = CompositeOutputHead(len(composite_vocab), d_model)
 
         self._init_weights(n_layer)
 
